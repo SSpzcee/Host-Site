@@ -1,5 +1,4 @@
 import streamlit as st
-import streamlit_autorefresh
 from streamlit_autorefresh import st_autorefresh
 from typing import List, Dict
 
