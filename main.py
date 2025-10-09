@@ -1,6 +1,6 @@
 import streamlit as st
+from streamlit_autorefresh import st_autorefresh
 from typing import List, Dict
-import streamlit_autorefresh
 
 st.set_page_config(page_title="Coordinating", layout="wide")
 
@@ -122,7 +122,7 @@ with tab1:
 			})
 			st.success(f"Added {name} (Party of {party_size}) to waitlist.")
 	# Auto-refresh every 30 seconds to update timers, even if switching tabs
-	streamlit_autorefresh(interval=30 * 1000, key="waitlistreamlit_autorefresh")
+	st_autorefresh(interval=30 * 1000, key="waitlist_autorefresh")
 	if st.session_state['waitlist']:
 		st.write("### Current Waitlist:")
 		now = time.time()
