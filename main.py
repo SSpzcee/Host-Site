@@ -97,7 +97,7 @@ if 'tables' not in st.session_state:
 	num_sections = min(max(len(st.session_state['servers']), 1), 9)
 	st.session_state['tables'] = initialize_tables(num_sections)
 
-st.title("Restaurant Host Management")
+st.title("Host Coordinating")
 
 tab1, tab2, tab3 = st.tabs(["Waitlist", "Servers & Sections", "Seating Chart"])
 
@@ -280,7 +280,7 @@ with tab3:
 		else:
 			st.info(f"Next server to be sat: {suggestion}")
 	else:
-		st.info("No suggestion available. All present servers may be skipped.")
+		st.info("No suggestion available.")
 	# Compact grid: show all present sections as expandable, with tables in a grid
 	for section in range(1, num_sections+1):
 		section_server = next((s['name'] for s in st.session_state['servers'] if s['section'] == section), None)
