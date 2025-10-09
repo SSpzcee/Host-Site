@@ -1,6 +1,6 @@
-
 import streamlit as st
 from typing import List, Dict
+import streamlit_autorefresh
 
 st.set_page_config(page_title="Coordinating", layout="wide")
 
