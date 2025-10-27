@@ -109,12 +109,12 @@ def seat_table_callback(table_num: int, server_name: str):
         this_table["status"] = "Taken"
         this_table["party"] = guest["name"]
         this_table["server"] = server_name
-        st.session_state[f"seat_msg_{table_num}"] = f"Seated {guest['name']} at Table {table_num}."
+        st.session_state[f"seat_msg_{table_num}"] = f"Sat {guest['name']} at Table {table_num}."
     else:
         this_table["status"] = "Taken"
         this_table["party"] = guest_name if guest_name else "Unknown Party"
         this_table["server"] = server_name
-        st.session_state[f"seat_msg_{table_num}"] = f"Seated {this_table['party']} at Table {table_num}."
+        st.session_state[f"seat_msg_{table_num}"] = f"Sat {this_table['party']} at Table {table_num}."
 
     save_persistent_state()
 
