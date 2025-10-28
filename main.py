@@ -18,53 +18,37 @@ SHEET_NAME = st.secrets["gcp_service_account"]["sheet_name"]
 # Authenticate using secrets
 creds = service_account.Credentials.from_service_account_info(
     st.secrets["gcp_service_account"],
-    scopes=[
-        "https://www.googleapis.com/auth/spreadsheets",
-        "https://www.googleapis.com/auth/drive",
-    ],
+    scopes=["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"],
 )
 gc = gspread.authorize(creds)
 
-# Try opening the sheet; if it doesn't exist, create it
+# Get or create sheet
 try:
     sh = gc.open(SHEET_NAME)
 except gspread.SpreadsheetNotFound:
+    # Create a new one if not found
     sh = gc.create(SHEET_NAME)
-    sh.share(
-        st.secrets["gcp_service_account"]["client_email"],
-        perm_type="user",
-        role="writer",
-    )
+    sh.share(st.secrets["gcp_service_account"]["client_email"], perm_type="user", role="writer")
+
 ws = sh.sheet1
 
-# --- Persistence configuration ---
-@st.cache_data(ttl=10)
-def load_persistent_state_from_sheet():
-    """Fetch and cache data from Google Sheets."""
+# --- Persistence config (Google Sheets) ---
+def load_persistent_state():
     try:
         data = ws.get_all_values()
         if data and data[0] and data[0][0]:
-            return json.loads(data[0][0])
+            raw = data[0][0]
+            json_data = json.loads(raw)
+            for k, v in json_data.items():
+                if k == "present_servers" and isinstance(v, list):
+                    st.session_state[k] = set(v)
+                else:
+                    st.session_state[k] = v
     except Exception as e:
         print("Failed to load persistent state:", e)
-    return {}
 
-def load_persistent_state():
-    """Load cached data into session_state."""
-    json_data = load_persistent_state_from_sheet()
-    for k, v in json_data.items():
-        if k == "present_servers" and isinstance(v, list):
-            st.session_state[k] = set(v)
-        else:
-            st.session_state[k] = v
 
 def save_persistent_state():
-    """Save state to Google Sheets with a cooldown to prevent spam writes."""
-    now = time.time()
-    if "last_save" in st.session_state and now - st.session_state["last_save"] < 3:
-        return  # Skip saving if last save < 3 seconds ago
-    st.session_state["last_save"] = now
-
     try:
         keys = [
             "waitlist",
@@ -83,11 +67,12 @@ def save_persistent_state():
                 if isinstance(v, set):
                     v = list(v)
                 data[k] = v
-        ws.update("A1", [[json.dumps(data, ensure_ascii=False)]])
+        json_str = json.dumps(data, ensure_ascii=False)
+        ws.update("A1", [[json_str]])
     except Exception as e:
         print("Failed to save persistent state:", e)
 
-# --- Callbacks ---
+# --- Callbacks (use on_click to avoid double-click issues) ---
 def _remove_mark_callback(server_name: str, section_idx: int):
     cur = st.session_state["server_scores"].get(server_name, 0)
     if cur > 0:
@@ -188,8 +173,9 @@ def remove_server_callback():
     else:
         st.session_state["remove_server_msg"] = "Invalid server index"
 
-# --- Initialize state ---
+# --- Session State Initialization ---
 load_persistent_state()
+
 
 # -------------------------------------------
 
