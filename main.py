@@ -26,6 +26,7 @@ gc = gspread.authorize(creds)
 try:
     sh = gc.open(SHEET_NAME)
 except gspread.SpreadsheetNotFound:
+    # Create a new one if not found
     sh = gc.create(SHEET_NAME)
     sh.share(st.secrets["gcp_service_account"]["client_email"], perm_type="user", role="writer")
 
@@ -71,7 +72,7 @@ def save_persistent_state():
     except Exception as e:
         print("Failed to save persistent state:", e)
 
-# --- Callbacks ---
+# --- Callbacks (use on_click to avoid double-click issues) ---
 def _remove_mark_callback(server_name: str, section_idx: int):
     cur = st.session_state["server_scores"].get(server_name, 0)
     if cur > 0:
@@ -172,9 +173,12 @@ def remove_server_callback():
     else:
         st.session_state["remove_server_msg"] = "Invalid server index"
 
-
 # --- Session State Initialization ---
 load_persistent_state()
+
+
+# -------------------------------------------
+
 
 if "waitlist" not in st.session_state:
     st.session_state["waitlist"] = []
@@ -264,6 +268,7 @@ def get_plan_tables(num_sections: int):
         return [[t for t in all_tables]]
     return plan
 
+
 def initialize_tables(num_sections: int):
     plan = get_plan_tables(num_sections)
     tables = []
@@ -272,12 +277,13 @@ def initialize_tables(num_sections: int):
             tables.append({"table": tnum, "section": section_idx + 1, "status": "Available", "server": None, "party": None})
     return tables
 
+
+# Ensure tables exist
 if "tables" not in st.session_state:
     num_sections = min(max(len(st.session_state["servers"]), 1), 9)
     st.session_state["tables"] = initialize_tables(num_sections)
 
 
-# --- PAGE SETUP ---
 st.title("Host Coordinating")
 tab1, tab2, tab3 = st.tabs(["Waitlist", "Servers & Sections", "Seating Chart"])
 
@@ -411,57 +417,130 @@ with tab2:
 # --- Seating Chart Tab ---
 with tab3:
     st.header("Seating Chart")
-    # (Keep all your current seating rotation, suggestions, and section expanders)
+    st.write("#### Table Status:")
 
-    # --- ADD VISUAL LAYOUT HERE ---
-    st.subheader("Visual Table Layout")
+    num_sections = min(max(len(st.session_state["servers"]), 1), 9)
+    present_server_names = st.session_state.get("present_servers", set())
+    present_servers = [s for s in st.session_state["servers"] if s["name"] in present_server_names]
+    present_servers_sorted = sorted(present_servers, key=lambda s: s["section"])
+    direction = st.session_state.get("seating_direction", "Up")
+    if direction == "Down":
+        present_servers_sorted = list(reversed(present_servers_sorted))
 
-    tables = st.session_state["tables"]
-    table_map = {t["table"]: t for t in tables}
-    sorted_tables = sorted(table_map.keys())
+    current_rotation = [s["name"] for s in present_servers_sorted]
+    if st.session_state.get("seating_rotation") != current_rotation:
+        st.session_state["seating_rotation"] = current_rotation
+        st.session_state["last_sat_server"] = None
+        save_persistent_state()
 
-    cols_per_row = 8
-    rows = [sorted_tables[i:i + cols_per_row] for i in range(0, len(sorted_tables), cols_per_row)]
+    for k in list(st.session_state["server_scores"].keys()):
+        if k not in current_rotation:
+            del st.session_state["server_scores"][k]
+    for k in current_rotation:
+        st.session_state["server_scores"].setdefault(k, 0)
 
-    for row in rows:
-        cols = st.columns(len(row))
-        for i, table_num in enumerate(row):
-            table = table_map[table_num]
-            status = table["status"]
-            color = "green"
-            label = f"Table {table_num}"
-            if status == "Taken":
-                color = "red"
-                label = f"🧍 {table['party']}"
-            elif status == "Bussing":
-                color = "orange"
-                label = f"🧹 Table {table_num}"
+    debug_data: List[Dict] = []
+    for s in present_servers_sorted:
+        debug_data.append(
+            {"Server": s["name"], "Section": s["section"], "Amount of Tables": st.session_state["server_scores"].get(s["name"], 0)}
+        )
+    if debug_data:
+        st.markdown("#### Server Rotation & Scores")
+        st.table(pd.DataFrame(debug_data))
 
-            with cols[i]:
-                if st.button(label, key=f"visual_table_{table_num}"):
-                    st.session_state["selected_table"] = table_num
+    waitlist = st.session_state["waitlist"]
+    suggestion = None
+    rotation = st.session_state.get("seating_rotation", [])
+    rotation = [s for s in rotation if s in present_server_names]
+    if rotation:
+        for s in rotation:
+            st.session_state["server_scores"].setdefault(s, 0)
+        min_score = min(st.session_state["server_scores"][s] for s in rotation)
+        suggestion_candidates = [s for s in rotation if st.session_state["server_scores"][s] == min_score]
+        if suggestion_candidates:
+            suggestion = suggestion_candidates[0]
 
-    # --- Details Panel ---
-    if "selected_table" in st.session_state:
-        selected_num = st.session_state["selected_table"]
-        selected_table = table_map[selected_num]
-        st.markdown(f"### Table {selected_num} Details")
+    st.markdown("### Seating Suggestion")
+    if suggestion:
+        if waitlist:
+            st.info(f"Seat next party ({waitlist[0]['name']}) with server: {suggestion}")
+        else:
+            st.info(f"Next server to be sat: {suggestion}")
+    else:
+        st.info("No suggestion available.")
 
-        status = selected_table["status"]
-        st.write(f"**Status:** {status}")
-        st.write(f"**Section:** {selected_table['section']}")
-        st.write(f"**Server:** {selected_table.get('server', 'N/A')}")
-        st.write(f"**Party:** {selected_table.get('party', 'N/A')}")
+    for section in range(1, num_sections + 1):
+        section_server = next((s["name"] for s in st.session_state["servers"] if s["section"] == section), None)
+        if section_server not in present_server_names:
+            continue
+        with st.expander(f"Section {section} ({section_server})", expanded=False):
+            # Per-server controls at top
+            col_left, col_right = st.columns([1, 1])
+            with col_left:
+                st.button(
+                    "Remove seating mark",
+                    key=f"remove_mark_server_{section}",
+                    on_click=_remove_mark_callback,
+                    args=(section_server, section),
+                )
+                rm_msg = st.session_state.pop(f"remove_mark_msg_{section}", None)
+                if rm_msg:
+                    st.success(f"Removed one seating mark from {section_server}.")
+            with col_right:
+                st.button(
+                    "Skip",
+                    key=f"skip_server_{section}",
+                    on_click=_skip_server_callback,
+                    args=(section_server, section),
+                )
+                skip_msg = st.session_state.pop(f"skip_msg_{section}", None)
+                if skip_msg:
+                    st.success(f"Advanced seating score for {section_server}.")
 
-        if status == "Available":
-            st.text_input("Party Name", key=f"visual_manual_party_{selected_num}")
-            waitlist_names = [f"{i+1}. {g['name']} (Party of {g['party_size']})" for i, g in enumerate(st.session_state["waitlist"])]
-            if waitlist_names:
-                st.selectbox("From Waitlist", ["-- None --"] + waitlist_names, key=f"visual_waitlist_select_{selected_num}")
-            section_server = next((s["name"] for s in st.session_state["servers"] if s["section"] == selected_table["section"]), None)
-            st.button("Seat", on_click=seat_table_callback, args=(selected_num, section_server))
+            section_tables = [t for t in st.session_state["tables"] if t["section"] == section]
+            grid_cols = 3
+            rows = [section_tables[i : i + grid_cols] for i in range(0, len(section_tables), grid_cols)]
+            for row in rows:
+                cols = st.columns(len(row))
+                for i, table in enumerate(row):
+                    with cols[i]:
+                        st.markdown(f"**Table {table['table']}**")
+                        status = table.get("status", "Available")
+                        if status == "Available":
+                            st.success("Available", icon="✅")
+                        elif status == "Taken":
+                            st.error(f"Taken: {table.get('party')}", icon="❌")
+                        elif status == "Bussing":
+                            st.warning(f"Bussing: {table.get('party', 'Previous Party')}", icon="🧹")
+                        else:
+                            st.info(f"Status: {status}")
 
-        elif status == "Taken":
-            st.button("Bus", on_click=bus_table_callback, args=(selected_num,))
-        elif status == "Bussing":
-            st.button("Clear", on_click=clear_table_callback, args=(selected_num,))
+                        if status == "Available":
+                            waitlist_names = [f"{idx+1}. {g['name']} (Party of {g['party_size']})" for idx, g in enumerate(st.session_state["waitlist"])]
+                            if waitlist_names:
+                                st.selectbox("Waitlist (optional)", options=["-- None --"] + waitlist_names, key=f"waitlist_select_{table['table']}")
+                            st.text_input("Party name (optional)", key=f"manual_party_{table['table']}")
+                            st.button(
+                                "Seat",
+                                key=f"seat_{table['table']}",
+                                on_click=seat_table_callback,
+                                args=(table["table"], section_server),
+                            )
+                            seat_msg = st.session_state.pop(f"seat_msg_{table['table']}", None)
+                            if seat_msg:
+                                st.success(seat_msg)
+                        elif status == "Taken":
+                            st.caption(f"Party: {table.get('party')}")
+                            st.caption(f"Server: {table.get('server')}")
+                            st.button("Bus", key=f"bus_{table['table']}", on_click=bus_table_callback, args=(table['table'],))
+                            bus_msg = st.session_state.pop(f"bus_msg_{table['table']}", None)
+                            if bus_msg:
+                                st.info(bus_msg)
+                        elif status == "Bussing":
+                            st.caption("Table is being bussed. Press Clear when clean.")
+                            st.caption(f"Last Party: {table.get('party')}")
+                            st.button("Clear", key=f"clear_{table['table']}", on_click=clear_table_callback, args=(table['table'],))
+                            clear_msg = st.session_state.pop(f"clear_msg_{table['table']}", None)
+                            if clear_msg:
+                                st.success(clear_msg)
+# ...existing code...
