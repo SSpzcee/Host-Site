@@ -1,4 +1,3 @@
-# ...existing code...
 import json
 import os
 from pathlib import Path
@@ -8,26 +7,44 @@ from typing import List, Dict
 import pandas as pd
 import streamlit as st
 from streamlit_autorefresh import st_autorefresh
+import gspread
+from google.oauth2 import service_account
 
 st.set_page_config(page_title="Coordinating", layout="wide")
 
-# --- Persistence config ---
-STATE_PATH = Path("/workspaces/testing/.streamlit_state.json")
+# --- Google Sheets setup ---
+SHEET_NAME = st.secrets["gcp_service_account"]["sheet_name"]
 
+# Authenticate using secrets
+creds = service_account.Credentials.from_service_account_info(
+    st.secrets["gcp_service_account"],
+    scopes=["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"],
+)
+gc = gspread.authorize(creds)
 
+# Get or create sheet
+try:
+    sh = gc.open(SHEET_NAME)
+except gspread.SpreadsheetNotFound:
+    # Create a new one if not found
+    sh = gc.create(SHEET_NAME)
+    sh.share(st.secrets["gcp_service_account"]["client_email"], perm_type="user", role="writer")
+
+ws = sh.sheet1
+
+# --- Persistence config (Google Sheets) ---
 def load_persistent_state():
     try:
-        if STATE_PATH.exists():
-            raw = STATE_PATH.read_text(encoding="utf-8")
-            data = json.loads(raw)
-            for k, v in data.items():
-                # restore present_servers as set
+        data = ws.get_all_values()
+        if data and data[0] and data[0][0]:
+            raw = data[0][0]
+            json_data = json.loads(raw)
+            for k, v in json_data.items():
                 if k == "present_servers" and isinstance(v, list):
                     st.session_state[k] = set(v)
                 else:
                     st.session_state[k] = v
     except Exception as e:
-        # don't crash the app on load errors
         print("Failed to load persistent state:", e)
 
 
@@ -47,16 +64,13 @@ def save_persistent_state():
         for k in keys:
             if k in st.session_state:
                 v = st.session_state[k]
-                # JSON can't encode sets; convert to list
                 if isinstance(v, set):
                     v = list(v)
                 data[k] = v
-        tmp = STATE_PATH.with_suffix(".tmp")
-        tmp.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
-        os.replace(str(tmp), str(STATE_PATH))
+        json_str = json.dumps(data, ensure_ascii=False)
+        ws.update("A1", [[json_str]])
     except Exception as e:
         print("Failed to save persistent state:", e)
-
 
 # --- Callbacks (use on_click to avoid double-click issues) ---
 def _remove_mark_callback(server_name: str, section_idx: int):
@@ -66,14 +80,11 @@ def _remove_mark_callback(server_name: str, section_idx: int):
     st.session_state[f"remove_mark_msg_{section_idx}"] = server_name
     save_persistent_state()
 
-
 def _skip_server_callback(server_name: str, section_idx: int):
-    # increment by 1 only
     st.session_state["server_scores"].setdefault(server_name, 0)
     st.session_state["server_scores"][server_name] += 1
     st.session_state[f"skip_msg_{section_idx}"] = server_name
     save_persistent_state()
-
 
 def seat_table_callback(table_num: int, server_name: str):
     select_key = f"waitlist_select_{table_num}"
@@ -81,14 +92,16 @@ def seat_table_callback(table_num: int, server_name: str):
     selected = st.session_state.get(select_key, "-- None --")
     selected_idx = None
     if isinstance(selected, str) and selected != "-- None --":
-        waitlist_names = [f"{idx+1}. {g['name']} (Party of {g['party_size']})" for idx, g in enumerate(st.session_state["waitlist"])]
+        waitlist_names = [
+            f"{idx+1}. {g['name']} (Party of {g['party_size']})"
+            for idx, g in enumerate(st.session_state["waitlist"])
+        ]
         try:
             selected_idx = waitlist_names.index(selected)
         except ValueError:
             selected_idx = None
     guest_name = st.session_state.get(manual_key, "").strip()
 
-    # find table object
     this_table = None
     for table in st.session_state["tables"]:
         if table["table"] == table_num:
@@ -98,7 +111,6 @@ def seat_table_callback(table_num: int, server_name: str):
         st.session_state[f"seat_msg_{table_num}"] = "Table not found"
         return
 
-    # increment server score once
     if server_name:
         st.session_state["server_scores"].setdefault(server_name, 0)
         st.session_state["server_scores"][server_name] += 1
@@ -109,15 +121,14 @@ def seat_table_callback(table_num: int, server_name: str):
         this_table["status"] = "Taken"
         this_table["party"] = guest["name"]
         this_table["server"] = server_name
-        st.session_state[f"seat_msg_{table_num}"] = f"Sat {guest['name']} at Table {table_num}."
+        st.session_state[f"seat_msg_{table_num}"] = f"Seated {guest['name']} at Table {table_num}."
     else:
         this_table["status"] = "Taken"
         this_table["party"] = guest_name if guest_name else "Unknown Party"
         this_table["server"] = server_name
-        st.session_state[f"seat_msg_{table_num}"] = f"Sat {this_table['party']} at Table {table_num}."
+        st.session_state[f"seat_msg_{table_num}"] = f"Seated {this_table['party']} at Table {table_num}."
 
     save_persistent_state()
-
 
 def bus_table_callback(table_num: int):
     for table in st.session_state["tables"]:
@@ -127,7 +138,6 @@ def bus_table_callback(table_num: int):
             save_persistent_state()
             return
     st.session_state[f"bus_msg_{table_num}"] = "Table not found"
-
 
 def clear_table_callback(table_num: int):
     for table in st.session_state["tables"]:
@@ -140,7 +150,6 @@ def clear_table_callback(table_num: int):
             return
     st.session_state[f"clear_msg_{table_num}"] = "Table not found"
 
-
 def remove_waitlist_callback():
     idx = st.session_state.get("remove_waitlist_idx", 1) - 1
     if 0 <= idx < len(st.session_state["waitlist"]):
@@ -150,7 +159,6 @@ def remove_waitlist_callback():
     else:
         st.session_state["remove_waitlist_msg"] = "Invalid index"
 
-
 def remove_server_callback():
     idx = st.session_state.get("remove_server_idx", 1) - 1
     if 0 <= idx < len(st.session_state["servers"]):
@@ -158,7 +166,6 @@ def remove_server_callback():
         st.session_state["present_servers"].discard(removed["name"])
         if removed["name"] in st.session_state["server_scores"]:
             del st.session_state["server_scores"][removed["name"]]
-        # Re-init tables
         num_sections = min(max(len(st.session_state["servers"]), 1), 9)
         st.session_state["tables"] = initialize_tables(num_sections)
         st.session_state["remove_server_msg"] = f"Removed server {removed['name']} from section {removed['section']}."
@@ -166,9 +173,10 @@ def remove_server_callback():
     else:
         st.session_state["remove_server_msg"] = "Invalid server index"
 
-
 # --- Session State Initialization ---
 load_persistent_state()
+
+
 
 if "waitlist" not in st.session_state:
     st.session_state["waitlist"] = []
