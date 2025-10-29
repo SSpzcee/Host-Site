@@ -692,7 +692,7 @@ with tab3:
     # ----------------------------
     # handle clicks (query param)
     # ----------------------------
-    params = st.query_params()
+    params = st.query_params
     if "table_click" in params:
         try:
             clicked_table = int(params["table_click"][0])
