@@ -9,6 +9,7 @@ import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 import gspread
 from google.oauth2 import service_account
+from PIL import Image
 
 st.set_page_config(page_title="Coordinating", layout="wide")
 
@@ -22,14 +23,16 @@ creds = service_account.Credentials.from_service_account_info(
 )
 gc = gspread.authorize(creds)
 
-# Get or create sheet
+# Try opening the sheet; if it doesn't exist, create it
 try:
     sh = gc.open(SHEET_NAME)
 except gspread.SpreadsheetNotFound:
-    # Create a new one if not found
     sh = gc.create(SHEET_NAME)
-    sh.share(st.secrets["gcp_service_account"]["client_email"], perm_type="user", role="writer")
-
+    sh.share(
+        st.secrets["gcp_service_account"]["client_email"],
+        perm_type="user",
+        role="writer",
+    )
 ws = sh.sheet1
 
 # --- Persistence config (Google Sheets) ---
@@ -40,11 +43,13 @@ def load_persistent_state():
             raw = data[0][0]
             json_data = json.loads(raw)
             for k, v in json_data.items():
+                # restore present_servers as set
                 if k == "present_servers" and isinstance(v, list):
                     st.session_state[k] = set(v)
                 else:
                     st.session_state[k] = v
     except Exception as e:
+        # don't crash the app on load errors
         print("Failed to load persistent state:", e)
 
 
@@ -64,6 +69,7 @@ def save_persistent_state():
         for k in keys:
             if k in st.session_state:
                 v = st.session_state[k]
+                # JSON can't encode sets; convert to list
                 if isinstance(v, set):
                     v = list(v)
                 data[k] = v
@@ -71,6 +77,7 @@ def save_persistent_state():
         ws.update("A1", [[json_str]])
     except Exception as e:
         print("Failed to save persistent state:", e)
+
 
 # --- Callbacks (use on_click to avoid double-click issues) ---
 def _remove_mark_callback(server_name: str, section_idx: int):
@@ -80,11 +87,14 @@ def _remove_mark_callback(server_name: str, section_idx: int):
     st.session_state[f"remove_mark_msg_{section_idx}"] = server_name
     save_persistent_state()
 
+
 def _skip_server_callback(server_name: str, section_idx: int):
+    # increment by 1 only
     st.session_state["server_scores"].setdefault(server_name, 0)
     st.session_state["server_scores"][server_name] += 1
     st.session_state[f"skip_msg_{section_idx}"] = server_name
     save_persistent_state()
+
 
 def seat_table_callback(table_num: int, server_name: str):
     select_key = f"waitlist_select_{table_num}"
@@ -130,6 +140,7 @@ def seat_table_callback(table_num: int, server_name: str):
 
     save_persistent_state()
 
+
 def bus_table_callback(table_num: int):
     for table in st.session_state["tables"]:
         if table["table"] == table_num:
@@ -138,6 +149,7 @@ def bus_table_callback(table_num: int):
             save_persistent_state()
             return
     st.session_state[f"bus_msg_{table_num}"] = "Table not found"
+
 
 def clear_table_callback(table_num: int):
     for table in st.session_state["tables"]:
@@ -150,6 +162,7 @@ def clear_table_callback(table_num: int):
             return
     st.session_state[f"clear_msg_{table_num}"] = "Table not found"
 
+
 def remove_waitlist_callback():
     idx = st.session_state.get("remove_waitlist_idx", 1) - 1
     if 0 <= idx < len(st.session_state["waitlist"]):
@@ -158,6 +171,7 @@ def remove_waitlist_callback():
         save_persistent_state()
     else:
         st.session_state["remove_waitlist_msg"] = "Invalid index"
+
 
 def remove_server_callback():
     idx = st.session_state.get("remove_server_idx", 1) - 1
@@ -173,12 +187,9 @@ def remove_server_callback():
     else:
         st.session_state["remove_server_msg"] = "Invalid server index"
 
+
 # --- Session State Initialization ---
 load_persistent_state()
-
-
-# -------------------------------------------
-
 
 if "waitlist" not in st.session_state:
     st.session_state["waitlist"] = []
@@ -469,78 +480,208 @@ with tab3:
     else:
         st.info("No suggestion available.")
 
-    for section in range(1, num_sections + 1):
-        section_server = next((s["name"] for s in st.session_state["servers"] if s["section"] == section), None)
-        if section_server not in present_server_names:
-            continue
-        with st.expander(f"Section {section} ({section_server})", expanded=False):
-            # Per-server controls at top
-            col_left, col_right = st.columns([1, 1])
-            with col_left:
-                st.button(
-                    "Remove seating mark",
-                    key=f"remove_mark_server_{section}",
-                    on_click=_remove_mark_callback,
-                    args=(section_server, section),
-                )
-                rm_msg = st.session_state.pop(f"remove_mark_msg_{section}", None)
-                if rm_msg:
-                    st.success(f"Removed one seating mark from {section_server}.")
-            with col_right:
-                st.button(
-                    "Skip",
-                    key=f"skip_server_{section}",
-                    on_click=_skip_server_callback,
-                    args=(section_server, section),
-                )
-                skip_msg = st.session_state.pop(f"skip_msg_{section}", None)
-                if skip_msg:
-                    st.success(f"Advanced seating score for {section_server}.")
+    # ----------------------------
+    # IMAGE + PIXEL-POSITION TABLE OVERLAY
+    # ----------------------------
 
-            section_tables = [t for t in st.session_state["tables"] if t["section"] == section]
-            grid_cols = 3
-            rows = [section_tables[i : i + grid_cols] for i in range(0, len(section_tables), grid_cols)]
-            for row in rows:
-                cols = st.columns(len(row))
-                for i, table in enumerate(row):
-                    with cols[i]:
-                        st.markdown(f"**Table {table['table']}**")
-                        status = table.get("status", "Available")
-                        if status == "Available":
-                            st.success("Available", icon="✅")
-                        elif status == "Taken":
-                            st.error(f"Taken: {table.get('party')}", icon="❌")
-                        elif status == "Bussing":
-                            st.warning(f"Bussing: {table.get('party', 'Previous Party')}", icon="🧹")
-                        else:
-                            st.info(f"Status: {status}")
+    # Path to your uploaded image (exists at this path per your upload)
+    FLOORPLAN_PATH = "/mnt/data/IMG_7118.jpeg"
 
-                        if status == "Available":
-                            waitlist_names = [f"{idx+1}. {g['name']} (Party of {g['party_size']})" for idx, g in enumerate(st.session_state["waitlist"])]
-                            if waitlist_names:
-                                st.selectbox("Waitlist (optional)", options=["-- None --"] + waitlist_names, key=f"waitlist_select_{table['table']}")
-                            st.text_input("Party name (optional)", key=f"manual_party_{table['table']}")
-                            st.button(
-                                "Seat",
-                                key=f"seat_{table['table']}",
-                                on_click=seat_table_callback,
-                                args=(table["table"], section_server),
-                            )
-                            seat_msg = st.session_state.pop(f"seat_msg_{table['table']}", None)
-                            if seat_msg:
-                                st.success(seat_msg)
-                        elif status == "Taken":
-                            st.caption(f"Party: {table.get('party')}")
-                            st.caption(f"Server: {table.get('server')}")
-                            st.button("Bus", key=f"bus_{table['table']}", on_click=bus_table_callback, args=(table['table'],))
-                            bus_msg = st.session_state.pop(f"bus_msg_{table['table']}", None)
-                            if bus_msg:
-                                st.info(bus_msg)
-                        elif status == "Bussing":
-                            st.caption("Table is being bussed. Press Clear when clean.")
-                            st.caption(f"Last Party: {table.get('party')}")
-                            st.button("Clear", key=f"clear_{table['table']}", on_click=clear_table_callback, args=(table['table'],))
-                            clear_msg = st.session_state.pop(f"clear_msg_{table['table']}", None)
-                            if clear_msg:
-                                st.success(clear_msg)
-# ...existing code...
+    # Default table positions (normalized percentages). Adjust these values to fine-tune.
+    # Each entry: table_number: {"x_pct": 0.0..1.0, "y_pct": 0.0..1.0}
+    # THESE ARE PLACEHOLDERS — tweak in small increments (0.01) to align perfectly.
+    TABLE_POSITIONS = {
+        # top-left cluster (31-37 and 41-43)
+        31: {"x_pct": 0.08, "y_pct": 0.10},
+        32: {"x_pct": 0.18, "y_pct": 0.10},
+        33: {"x_pct": 0.28, "y_pct": 0.10},
+        34: {"x_pct": 0.38, "y_pct": 0.10},
+        35: {"x_pct": 0.48, "y_pct": 0.10},
+        36: {"x_pct": 0.58, "y_pct": 0.10},
+        37: {"x_pct": 0.68, "y_pct": 0.10},
+        41: {"x_pct": 0.78, "y_pct": 0.10},
+        42: {"x_pct": 0.86, "y_pct": 0.10},
+        43: {"x_pct": 0.94, "y_pct": 0.10},
+
+        # big middle block (1..11 and 21..30)
+        1: {"x_pct": 0.10, "y_pct": 0.30},
+        2: {"x_pct": 0.18, "y_pct": 0.30},
+        3: {"x_pct": 0.26, "y_pct": 0.30},
+        4: {"x_pct": 0.34, "y_pct": 0.30},
+        5: {"x_pct": 0.42, "y_pct": 0.30},
+        6: {"x_pct": 0.50, "y_pct": 0.30},
+        7: {"x_pct": 0.58, "y_pct": 0.30},
+        8: {"x_pct": 0.66, "y_pct": 0.30},
+        9: {"x_pct": 0.74, "y_pct": 0.30},
+        10: {"x_pct": 0.82, "y_pct": 0.30},
+        11: {"x_pct": 0.90, "y_pct": 0.30},
+
+        21: {"x_pct": 0.10, "y_pct": 0.40},
+        22: {"x_pct": 0.18, "y_pct": 0.40},
+        23: {"x_pct": 0.26, "y_pct": 0.40},
+        24: {"x_pct": 0.34, "y_pct": 0.40},
+        25: {"x_pct": 0.42, "y_pct": 0.40},
+        26: {"x_pct": 0.50, "y_pct": 0.40},
+        27: {"x_pct": 0.58, "y_pct": 0.40},
+        28: {"x_pct": 0.66, "y_pct": 0.40},
+        29: {"x_pct": 0.74, "y_pct": 0.40},
+        30: {"x_pct": 0.82, "y_pct": 0.40},
+
+        # right/lower block (51..65, 61..65)
+        51: {"x_pct": 0.12, "y_pct": 0.60},
+        52: {"x_pct": 0.20, "y_pct": 0.60},
+        53: {"x_pct": 0.28, "y_pct": 0.60},
+        54: {"x_pct": 0.36, "y_pct": 0.60},
+        55: {"x_pct": 0.44, "y_pct": 0.60},
+
+        61: {"x_pct": 0.60, "y_pct": 0.60},
+        62: {"x_pct": 0.68, "y_pct": 0.60},
+        63: {"x_pct": 0.76, "y_pct": 0.60},
+        64: {"x_pct": 0.84, "y_pct": 0.60},
+        65: {"x_pct": 0.92, "y_pct": 0.60},
+
+        # extra positions for 36,37 cluster lower
+        36: {"x_pct": 0.58, "y_pct": 0.12},
+        37: {"x_pct": 0.68, "y_pct": 0.12},
+        36: {"x_pct": 0.58, "y_pct": 0.12},
+        37: {"x_pct": 0.68, "y_pct": 0.12},
+
+        # Fallback positions for any other tables not explicitly set (will be centered)
+    }
+
+    # for safety: ensure every table in tables has a position; if missing, center it (0.5,0.5)
+    for t in st.session_state["tables"]:
+        tnum = t["table"]
+        if tnum not in TABLE_POSITIONS:
+            TABLE_POSITIONS[tnum] = {"x_pct": 0.5, "y_pct": 0.5}
+
+    # Load image to get real size
+    try:
+        img = Image.open(FLOORPLAN_PATH)
+        img_width, img_height = img.size
+    except Exception as e:
+        st.error(f"Failed to load floorplan image at {FLOORPLAN_PATH}: {e}")
+        img = None
+        img_width, img_height = 1000, 600  # fallback
+
+    # Handle clicks via query params:
+    params = st.experimental_get_query_params()
+    if "table_click" in params:
+        try:
+            clicked_table = int(params["table_click"][0])
+            # cycle status for clicked table
+            tbl_obj = next((x for x in st.session_state["tables"] if x["table"] == clicked_table), None)
+            if tbl_obj:
+                old = tbl_obj.get("status", "Available")
+                if old == "Available":
+                    tbl_obj["status"] = "Taken"
+                    # increment server score for that section's server
+                    sec = tbl_obj.get("section")
+                    server_for_section = next((s["name"] for s in st.session_state["servers"] if s["section"] == sec), None)
+                    if server_for_section:
+                        st.session_state["server_scores"].setdefault(server_for_section, 0)
+                        st.session_state["server_scores"][server_for_section] += 1
+                        st.session_state["last_sat_server"] = server_for_section
+                elif old == "Taken":
+                    tbl_obj["status"] = "Bussing"
+                else:
+                    tbl_obj["status"] = "Available"
+                    tbl_obj["party"] = None
+                    tbl_obj["server"] = None
+                save_persistent_state()
+        except Exception as e:
+            print("Error processing table_click param:", e)
+        # clear param so click isn't processed repeatedly
+        st.experimental_set_query_params()
+
+    # CSS for overlay buttons
+    st.markdown(
+        """
+        <style>
+        .floorplan-wrap {
+            position: relative;
+            display: inline-block;
+        }
+        .table-button {
+            position: absolute;
+            width: 44px;
+            height: 44px;
+            line-height: 44px;
+            border-radius: 22px;
+            text-align: center;
+            font-weight: bold;
+            color: white;
+            border: 2px solid rgba(0,0,0,0.15);
+            box-shadow: 0 2px 6px rgba(0,0,0,0.15);
+            cursor: pointer;
+            transform: translate(-50%, -50%); /* center by coords */
+            z-index: 10;
+            text-decoration: none;
+        }
+        .available { background: #2ecc71; }   /* green */
+        .taken { background: #e74c3c; }       /* red */
+        .bussing { background: #f1c40f; color: black; } /* yellow */
+        .section-label {
+            padding: 6px;
+            border-radius: 6px;
+            display: inline-block;
+            margin-bottom: 6px;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # Show legend
+    st.markdown("**Legend:** 🟢 Available — 🔴 Taken — 🟡 Bussing")
+    st.markdown("---")
+
+    # Render image and overlay buttons inside a container
+    if img is not None:
+        # Show image (native size)
+        st.markdown("<div class='floorplan-wrap'>", unsafe_allow_html=True)
+        st.image(img, use_column_width=False)
+        # Render each table as absolute positioned link that sets ?table_click=tnum
+        for t in st.session_state["tables"]:
+            tnum = t["table"]
+            pos = TABLE_POSITIONS.get(tnum, {"x_pct": 0.5, "y_pct": 0.5})
+            left_px = int(pos["x_pct"] * img_width)
+            top_px = int(pos["y_pct"] * img_height)
+            status = t.get("status", "Available")
+            section = t.get("section") or "-"
+            # find server assigned to that section
+            server_for_section = next((s["name"] for s in st.session_state["servers"] if s["section"] == section), None)
+            server_display = server_for_section or "No server"
+
+            if status == "Available":
+                cls = "available"
+                emoji = "🟢"
+            elif status == "Taken":
+                cls = "taken"
+                emoji = "🔴"
+            elif status == "Bussing":
+                cls = "bussing"
+                emoji = "🟡"
+            else:
+                cls = "available"
+                emoji = "⚪️"
+
+            title = f"Table {tnum} | Section {section} | Server: {server_display} | Status: {status}"
+            href = f"?table_click={tnum}"
+
+            # Section color for label (choose from palette)
+            SECTION_COLORS = ["#a8d0e6", "#f7d794", "#f6b93b", "#f8a5c2", "#c7ecee", "#d6a2e8", "#b8e994", "#f6e58d", "#badc58"]
+            sec_color = SECTION_COLORS[(section - 1) % len(SECTION_COLORS)] if isinstance(section, int) and section >= 1 else "#dddddd"
+
+            # Draw the button
+            st.markdown(
+                f"""
+                <a class="table-button {cls}" href="{href}" title="{title}" style="left:{left_px}px; top:{top_px}px;">
+                    {emoji}<br/><span style="font-size:11px">{tnum}</span>
+                </a>
+                """,
+                unsafe_allow_html=True,
+            )
+        st.markdown("</div>", unsafe_allow_html=True)
+    else:
+        st.info("Floorplan image not available; switching to textual layout.")
