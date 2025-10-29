@@ -9,7 +9,6 @@ import streamlit as st
 from streamlit_autorefresh import st_autorefresh
 import gspread
 from google.oauth2 import service_account
-from PIL import Image
 
 st.set_page_config(page_title="Coordinating", layout="wide")
 
@@ -96,47 +95,40 @@ def _skip_server_callback(server_name: str, section_idx: int):
     save_persistent_state()
 
 
-def seat_table_callback(table_num: int, server_name: str):
-    select_key = f"waitlist_select_{table_num}"
-    manual_key = f"manual_party_{table_num}"
-    selected = st.session_state.get(select_key, "-- None --")
-    selected_idx = None
-    if isinstance(selected, str) and selected != "-- None --":
-        waitlist_names = [
-            f"{idx+1}. {g['name']} (Party of {g['party_size']})"
-            for idx, g in enumerate(st.session_state["waitlist"])
-        ]
-        try:
-            selected_idx = waitlist_names.index(selected)
-        except ValueError:
-            selected_idx = None
-    guest_name = st.session_state.get(manual_key, "").strip()
-
-    this_table = None
-    for table in st.session_state["tables"]:
-        if table["table"] == table_num:
-            this_table = table
-            break
+def seat_table_callback(table_num: int, server_name: str, selected_waitlist_idx: int | None = None, manual_name: str | None = None):
+    """
+    Seat either the selected waitlist person (selected_waitlist_idx) or the manual_name at table_num.
+    If selected_waitlist_idx is provided, remove that person from the waitlist.
+    This function updates table status and server score.
+    """
+    this_table = next((t for t in st.session_state["tables"] if t["table"] == table_num), None)
     if this_table is None:
         st.session_state[f"seat_msg_{table_num}"] = "Table not found"
         return
 
+    # increment server score once for seating
     if server_name:
         st.session_state["server_scores"].setdefault(server_name, 0)
         st.session_state["server_scores"][server_name] += 1
         st.session_state["last_sat_server"] = server_name
 
-    if selected_idx is not None and 0 <= selected_idx < len(st.session_state["waitlist"]):
-        guest = st.session_state["waitlist"].pop(selected_idx)
+    if selected_waitlist_idx is not None and 0 <= selected_waitlist_idx < len(st.session_state["waitlist"]):
+        guest = st.session_state["waitlist"].pop(selected_waitlist_idx)
         this_table["status"] = "Taken"
         this_table["party"] = guest["name"]
         this_table["server"] = server_name
         st.session_state[f"seat_msg_{table_num}"] = f"Seated {guest['name']} at Table {table_num}."
-    else:
+    elif manual_name:
         this_table["status"] = "Taken"
-        this_table["party"] = guest_name if guest_name else "Unknown Party"
+        this_table["party"] = manual_name
         this_table["server"] = server_name
-        st.session_state[f"seat_msg_{table_num}"] = f"Seated {this_table['party']} at Table {table_num}."
+        st.session_state[f"seat_msg_{table_num}"] = f"Seated {manual_name} at Table {table_num}."
+    else:
+        # If nothing chosen, still mark as taken with unknown party
+        this_table["status"] = "Taken"
+        this_table["party"] = "Unknown Party"
+        this_table["server"] = server_name
+        st.session_state[f"seat_msg_{table_num}"] = f"Seated Unknown Party at Table {table_num}."
 
     save_persistent_state()
 
@@ -205,7 +197,9 @@ if "last_sat_server" not in st.session_state:
     st.session_state["last_sat_server"] = None
 if "server_scores" not in st.session_state or not isinstance(st.session_state["server_scores"], dict):
     st.session_state["server_scores"] = {}
-
+# track last table clicked for the seat-from-waitlist panel
+if "last_clicked_table" not in st.session_state:
+    st.session_state["last_clicked_table"] = None
 
 # --- Table Plan Definitions ---
 TABLE_PLANS = {
@@ -305,6 +299,7 @@ with tab1:
     with st.form("Add to Waitlist"):
         name = st.text_input("Guest Name")
         party_size = st.number_input("Party Size", min_value=1, max_value=20, value=2)
+        phone = st.text_input("Phone (optional) — digits only, include country code if needed")
         notes = st.text_input("Notes (optional)")
         min_wait = st.number_input("Minimum Wait (minutes)", min_value=0, max_value=180, value=0)
         max_wait = st.number_input("Maximum Wait (minutes)", min_value=0, max_value=180, value=30)
@@ -314,6 +309,7 @@ with tab1:
                 {
                     "name": name,
                     "party_size": party_size,
+                    "phone": phone,
                     "notes": notes,
                     "added_time": time.time(),
                     "min_wait": min_wait,
@@ -332,6 +328,7 @@ with tab1:
             wait_mins = int((now - guest.get("added_time", now)) // 60)
             min_wait = guest.get("min_wait", 0)
             max_wait = guest.get("max_wait", 0)
+            phone_display = guest.get("phone") or "No phone"
             if wait_mins < min_wait:
                 indicator = f"🟢 Can wait longer ({min_wait - wait_mins} min left)"
             elif wait_mins >= max_wait:
@@ -339,7 +336,7 @@ with tab1:
             else:
                 indicator = f"🟡 Should be seated soon ({max_wait - wait_mins} min left)"
             st.write(
-                f"{i+1}. {guest['name']} (Party of {guest['party_size']}) - {guest['notes']} | Wait: {wait_mins} min | Min: {min_wait} | Max: {max_wait} | {indicator}"
+                f"{i+1}. {guest['name']} (Party of {guest['party_size']}) - {guest['notes']} | Phone: {phone_display} | Wait: {wait_mins} min | Min: {min_wait} | Max: {max_wait} | {indicator}"
             )
 
         remove_idx = st.number_input(
@@ -481,95 +478,225 @@ with tab3:
         st.info("No suggestion available.")
 
     # ----------------------------
-    # IMAGE + PIXEL-POSITION TABLE OVERLAY
+    # VISUAL LAYOUT (NO IMAGE) — normalized positions
     # ----------------------------
 
-    # Path to your uploaded image (exists at this path per your upload)
-    FLOORPLAN_PATH = "/mnt/data/IMG_7118.jpeg"
-
-    # Default table positions (normalized percentages). Adjust these values to fine-tune.
-    # Each entry: table_number: {"x_pct": 0.0..1.0, "y_pct": 0.0..1.0}
-    # THESE ARE PLACEHOLDERS — tweak in small increments (0.01) to align perfectly.
+    # Default table positions (normalized percentages). These match your photo layout conceptually.
+    # Edit the percentages to fine-tune positions; values are 0.0..1.0 (left/top).
     TABLE_POSITIONS = {
-        # top-left cluster (31-37 and 41-43)
-        31: {"x_pct": 0.08, "y_pct": 0.10},
-        32: {"x_pct": 0.18, "y_pct": 0.10},
-        33: {"x_pct": 0.28, "y_pct": 0.10},
-        34: {"x_pct": 0.38, "y_pct": 0.10},
-        35: {"x_pct": 0.48, "y_pct": 0.10},
-        36: {"x_pct": 0.58, "y_pct": 0.10},
-        37: {"x_pct": 0.68, "y_pct": 0.10},
-        41: {"x_pct": 0.78, "y_pct": 0.10},
-        42: {"x_pct": 0.86, "y_pct": 0.10},
-        43: {"x_pct": 0.94, "y_pct": 0.10},
+        31: {"x_pct": 0.08, "y_pct": 0.08},
+        32: {"x_pct": 0.16, "y_pct": 0.08},
+        33: {"x_pct": 0.24, "y_pct": 0.08},
+        34: {"x_pct": 0.32, "y_pct": 0.08},
+        35: {"x_pct": 0.40, "y_pct": 0.08},
+        36: {"x_pct": 0.48, "y_pct": 0.08},
+        37: {"x_pct": 0.56, "y_pct": 0.08},
+        41: {"x_pct": 0.64, "y_pct": 0.08},
+        42: {"x_pct": 0.72, "y_pct": 0.08},
+        43: {"x_pct": 0.80, "y_pct": 0.08},
 
-        # big middle block (1..11 and 21..30)
-        1: {"x_pct": 0.10, "y_pct": 0.30},
-        2: {"x_pct": 0.18, "y_pct": 0.30},
-        3: {"x_pct": 0.26, "y_pct": 0.30},
-        4: {"x_pct": 0.34, "y_pct": 0.30},
-        5: {"x_pct": 0.42, "y_pct": 0.30},
-        6: {"x_pct": 0.50, "y_pct": 0.30},
-        7: {"x_pct": 0.58, "y_pct": 0.30},
-        8: {"x_pct": 0.66, "y_pct": 0.30},
-        9: {"x_pct": 0.74, "y_pct": 0.30},
-        10: {"x_pct": 0.82, "y_pct": 0.30},
-        11: {"x_pct": 0.90, "y_pct": 0.30},
+        1: {"x_pct": 0.08, "y_pct": 0.28},
+        2: {"x_pct": 0.18, "y_pct": 0.28},
+        3: {"x_pct": 0.28, "y_pct": 0.28},
+        4: {"x_pct": 0.38, "y_pct": 0.28},
+        5: {"x_pct": 0.48, "y_pct": 0.28},
+        6: {"x_pct": 0.58, "y_pct": 0.28},
+        7: {"x_pct": 0.68, "y_pct": 0.28},
+        8: {"x_pct": 0.78, "y_pct": 0.28},
+        9: {"x_pct": 0.88, "y_pct": 0.28},
+        10: {"x_pct": 0.96, "y_pct": 0.28},
+        11: {"x_pct": 0.92, "y_pct": 0.36},
 
-        21: {"x_pct": 0.10, "y_pct": 0.40},
-        22: {"x_pct": 0.18, "y_pct": 0.40},
-        23: {"x_pct": 0.26, "y_pct": 0.40},
-        24: {"x_pct": 0.34, "y_pct": 0.40},
-        25: {"x_pct": 0.42, "y_pct": 0.40},
-        26: {"x_pct": 0.50, "y_pct": 0.40},
-        27: {"x_pct": 0.58, "y_pct": 0.40},
-        28: {"x_pct": 0.66, "y_pct": 0.40},
-        29: {"x_pct": 0.74, "y_pct": 0.40},
-        30: {"x_pct": 0.82, "y_pct": 0.40},
+        21: {"x_pct": 0.08, "y_pct": 0.36},
+        22: {"x_pct": 0.18, "y_pct": 0.36},
+        23: {"x_pct": 0.28, "y_pct": 0.36},
+        24: {"x_pct": 0.38, "y_pct": 0.36},
+        25: {"x_pct": 0.48, "y_pct": 0.36},
+        26: {"x_pct": 0.58, "y_pct": 0.36},
+        27: {"x_pct": 0.68, "y_pct": 0.36},
+        28: {"x_pct": 0.78, "y_pct": 0.36},
+        29: {"x_pct": 0.88, "y_pct": 0.36},
+        30: {"x_pct": 0.96, "y_pct": 0.36},
 
-        # right/lower block (51..65, 61..65)
-        51: {"x_pct": 0.12, "y_pct": 0.60},
-        52: {"x_pct": 0.20, "y_pct": 0.60},
-        53: {"x_pct": 0.28, "y_pct": 0.60},
-        54: {"x_pct": 0.36, "y_pct": 0.60},
-        55: {"x_pct": 0.44, "y_pct": 0.60},
+        51: {"x_pct": 0.14, "y_pct": 0.60},
+        52: {"x_pct": 0.24, "y_pct": 0.60},
+        53: {"x_pct": 0.34, "y_pct": 0.60},
+        54: {"x_pct": 0.44, "y_pct": 0.60},
+        55: {"x_pct": 0.54, "y_pct": 0.60},
 
-        61: {"x_pct": 0.60, "y_pct": 0.60},
-        62: {"x_pct": 0.68, "y_pct": 0.60},
-        63: {"x_pct": 0.76, "y_pct": 0.60},
-        64: {"x_pct": 0.84, "y_pct": 0.60},
-        65: {"x_pct": 0.92, "y_pct": 0.60},
-
-        # extra positions for 36,37 cluster lower
-        36: {"x_pct": 0.58, "y_pct": 0.12},
-        37: {"x_pct": 0.68, "y_pct": 0.12},
-        36: {"x_pct": 0.58, "y_pct": 0.12},
-        37: {"x_pct": 0.68, "y_pct": 0.12},
-
-        # Fallback positions for any other tables not explicitly set (will be centered)
+        61: {"x_pct": 0.64, "y_pct": 0.60},
+        62: {"x_pct": 0.74, "y_pct": 0.60},
+        63: {"x_pct": 0.84, "y_pct": 0.60},
+        64: {"x_pct": 0.92, "y_pct": 0.60},
+        65: {"x_pct": 0.98, "y_pct": 0.60},
     }
 
-    # for safety: ensure every table in tables has a position; if missing, center it (0.5,0.5)
+    # ensure all tables have a position; fallback to center
     for t in st.session_state["tables"]:
         tnum = t["table"]
         if tnum not in TABLE_POSITIONS:
             TABLE_POSITIONS[tnum] = {"x_pct": 0.5, "y_pct": 0.5}
 
-    # Load image to get real size
-    try:
-        img = Image.open(FLOORPLAN_PATH)
-        img_width, img_height = img.size
-    except Exception as e:
-        st.error(f"Failed to load floorplan image at {FLOORPLAN_PATH}: {e}")
-        img = None
-        img_width, img_height = 1000, 600  # fallback
+    # CSS for the full-width visual layout
+    st.markdown(
+        """
+        <style>
+        .floorplan-container {
+            position: relative;
+            width: 100%;
+            height: 70vh; /* fills viewport height - adjust if you want taller/shorter */
+            border: 1px solid rgba(0,0,0,0.08);
+            background: linear-gradient(180deg, #ffffff, #fafafa);
+            margin-bottom: 12px;
+            overflow: visible;
+        }
+        .table-btn {
+            position: absolute;
+            width: 56px;
+            height: 56px;
+            line-height: 56px;
+            border-radius: 28px;
+            text-align: center;
+            font-weight: 700;
+            color: white;
+            border: 2px solid rgba(0,0,0,0.08);
+            box-shadow: 0 2px 6px rgba(0,0,0,0.12);
+            transform: translate(-50%, -50%);
+            cursor: pointer;
+            display: inline-block;
+            text-decoration: none;
+        }
+        .available { background: #2ecc71; }   /* green */
+        .taken { background: #e74c3c; }       /* red */
+        .bussing { background: #f1c40f; color: black; } /* yellow */
+        .table-label {
+            position: absolute;
+            transform: translate(-50%, -50%);
+            font-size: 11px;
+            padding: 4px 6px;
+            border-radius: 6px;
+            color: #222;
+            background: rgba(255,255,255,0.9);
+            border: 1px solid rgba(0,0,0,0.06);
+        }
+        .section-name {
+            position: absolute;
+            transform: translate(-50%, -50%);
+            padding: 6px 8px;
+            border-radius: 6px;
+            font-size: 13px;
+            font-weight: 600;
+            color: #111;
+            box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+        }
+        .legend {
+            display:flex;
+            gap:12px;
+            align-items:center;
+            margin-bottom:6px;
+        }
+        .legend .item { display:flex; gap:6px; align-items:center; }
+        .legend .dot { width:16px; height:16px; border-radius:8px; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
-    # Handle clicks via query params:
+    # Show legend and instructions
+    st.markdown(
+        """
+        <div class="legend">
+            <div class="item"><div class="dot" style="background:#2ecc71"></div>Available</div>
+            <div class="item"><div class="dot" style="background:#e74c3c"></div>Taken (clicking Available→Taken increments server score)</div>
+            <div class="item"><div class="dot" style="background:#f1c40f"></div>Bussing</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    # Compute per-plan section assignment and section label positions (average table positions)
+    plan = get_plan_tables(num_sections)
+    # plan is list of sections; compute center for each section
+    section_centers = {}
+    for idx, table_nums in enumerate(plan):
+        sec = idx + 1
+        xs = []
+        ys = []
+        for tnum in table_nums:
+            pos = TABLE_POSITIONS.get(tnum, {"x_pct": 0.5, "y_pct": 0.5})
+            xs.append(pos["x_pct"])
+            ys.append(pos["y_pct"])
+        if xs and ys:
+            section_centers[sec] = {"x_pct": sum(xs) / len(xs), "y_pct": max(0.02, sum(ys) / len(ys) - 0.08)}
+        else:
+            section_centers[sec] = {"x_pct": 0.5, "y_pct": 0.05}
+
+    # Section colors palette
+    SECTION_COLORS = ["#a8d0e6", "#f7d794", "#f6b93b", "#f8a5c2", "#c7ecee", "#d6a2e8", "#b8e994", "#f6e58d", "#badc58"]
+
+    # Create container and render layout (use HTML anchors for clicks with query param to detect)
+    st.markdown('<div class="floorplan-container" id="floorplan">', unsafe_allow_html=True)
+
+    # Render section labels (server names)
+    for sec in range(1, num_sections + 1):
+        center = section_centers.get(sec, {"x_pct": 0.5, "y_pct": 0.05})
+        left_pct = int(center["x_pct"] * 100)
+        top_pct = int(center["y_pct"] * 100)
+        # find server assigned to this section (if any)
+        server_for_section = next((s["name"] for s in st.session_state["servers"] if s["section"] == sec), None)
+        server_display = server_for_section or "No server"
+        color = SECTION_COLORS[(sec - 1) % len(SECTION_COLORS)]
+        st.markdown(
+            f'<div class="section-name" style="left:{left_pct}%; top:{top_pct}%; background:{color}">Section {sec}<br/>{server_display}</div>',
+            unsafe_allow_html=True,
+        )
+
+    # Render table buttons
+    for t in st.session_state["tables"]:
+        tnum = t["table"]
+        pos = TABLE_POSITIONS.get(tnum, {"x_pct": 0.5, "y_pct": 0.5})
+        left_pct = pos["x_pct"] * 100
+        top_pct = pos["y_pct"] * 100
+        status = t.get("status", "Available")
+        section = t.get("section") or "-"
+        server_for_section = next((s["name"] for s in st.session_state["servers"] if s["section"] == section), None)
+        server_display = server_for_section or "No server"
+
+        if status == "Available":
+            cls = "available"
+            emoji = "🟢"
+        elif status == "Taken":
+            cls = "taken"
+            emoji = "🔴"
+        elif status == "Bussing":
+            cls = "bussing"
+            emoji = "🟡"
+        else:
+            cls = "available"
+            emoji = "⚪️"
+
+        title = f"Table {tnum} | Section {section} | Server: {server_display} | Status: {status}"
+        href = f"?table_click={tnum}"
+
+        st.markdown(
+            f'''
+            <a class="table-btn {cls}" href="{href}" title="{title}" style="left:{left_pct}%; top:{top_pct}%">
+                <div style="font-size:18px;">{tnum}</div>
+            </a>
+            ''',
+            unsafe_allow_html=True,
+        )
+
+    st.markdown('</div>', unsafe_allow_html=True)
+
+    # ----------------------------
+    # handle clicks (query param)
+    # ----------------------------
     params = st.experimental_get_query_params()
     if "table_click" in params:
         try:
             clicked_table = int(params["table_click"][0])
-            # cycle status for clicked table
+            # cycle status for clicked table immediately (user requested click cycles)
             tbl_obj = next((x for x in st.session_state["tables"] if x["table"] == clicked_table), None)
             if tbl_obj:
                 old = tbl_obj.get("status", "Available")
@@ -588,100 +715,65 @@ with tab3:
                     tbl_obj["status"] = "Available"
                     tbl_obj["party"] = None
                     tbl_obj["server"] = None
+                # set last_clicked_table for optional manual seating UI
+                st.session_state["last_clicked_table"] = clicked_table
                 save_persistent_state()
         except Exception as e:
             print("Error processing table_click param:", e)
         # clear param so click isn't processed repeatedly
         st.experimental_set_query_params()
 
-    # CSS for overlay buttons
-    st.markdown(
-        """
-        <style>
-        .floorplan-wrap {
-            position: relative;
-            display: inline-block;
-        }
-        .table-button {
-            position: absolute;
-            width: 44px;
-            height: 44px;
-            line-height: 44px;
-            border-radius: 22px;
-            text-align: center;
-            font-weight: bold;
-            color: white;
-            border: 2px solid rgba(0,0,0,0.15);
-            box-shadow: 0 2px 6px rgba(0,0,0,0.15);
-            cursor: pointer;
-            transform: translate(-50%, -50%); /* center by coords */
-            z-index: 10;
-            text-decoration: none;
-        }
-        .available { background: #2ecc71; }   /* green */
-        .taken { background: #e74c3c; }       /* red */
-        .bussing { background: #f1c40f; color: black; } /* yellow */
-        .section-label {
-            padding: 6px;
-            border-radius: 6px;
-            display: inline-block;
-            margin-bottom: 6px;
-        }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    # Show legend
-    st.markdown("**Legend:** 🟢 Available — 🔴 Taken — 🟡 Bussing")
+    # ----------------------------
+    # Right-side control panel: seat selected table from waitlist (optional)
+    # ----------------------------
     st.markdown("---")
+    st.subheader("Table Controls / Seat from Waitlist (optional)")
 
-    # Render image and overlay buttons inside a container
-    if img is not None:
-        # Show image (native size)
-        st.markdown("<div class='floorplan-wrap'>", unsafe_allow_html=True)
-        st.image(img, use_column_width=False)
-        # Render each table as absolute positioned link that sets ?table_click=tnum
-        for t in st.session_state["tables"]:
-            tnum = t["table"]
-            pos = TABLE_POSITIONS.get(tnum, {"x_pct": 0.5, "y_pct": 0.5})
-            left_px = int(pos["x_pct"] * img_width)
-            top_px = int(pos["y_pct"] * img_height)
-            status = t.get("status", "Available")
-            section = t.get("section") or "-"
-            # find server assigned to that section
-            server_for_section = next((s["name"] for s in st.session_state["servers"] if s["section"] == section), None)
-            server_display = server_for_section or "No server"
+    col_a, col_b = st.columns([2, 1])
+    with col_a:
+        if st.session_state["last_clicked_table"]:
+            tnum = st.session_state["last_clicked_table"]
+            st.write(f"Selected Table: **{tnum}**")
+            tbl_obj = next((x for x in st.session_state["tables"] if x["table"] == tnum), None)
+            if tbl_obj:
+                st.write(f"Current status: **{tbl_obj.get('status', 'Available')}**")
+                st.write(f"Section: **{tbl_obj.get('section')}**")
+                server_for_section = next((s["name"] for s in st.session_state["servers"] if s["section"] == tbl_obj.get("section")), None)
+                st.write(f"Server: **{server_for_section or 'No server'}**")
 
-            if status == "Available":
-                cls = "available"
-                emoji = "🟢"
-            elif status == "Taken":
-                cls = "taken"
-                emoji = "🔴"
-            elif status == "Bussing":
-                cls = "bussing"
-                emoji = "🟡"
+                # Choose waitlist person to seat
+                waitlist_names = [f"{idx+1}. {g['name']} (Party {g['party_size']})" for idx, g in enumerate(st.session_state["waitlist"])]
+                selected_idx = None
+                if waitlist_names:
+                    sel = st.selectbox("Choose a guest from the waitlist to seat (optional)", options=["-- None --"] + waitlist_names, key=f"seat_select_{tnum}")
+                    if sel and sel != "-- None --":
+                        try:
+                            selected_idx = waitlist_names.index(sel)
+                        except ValueError:
+                            selected_idx = None
+
+                manual_party = st.text_input("Or enter manual party name (optional)", key=f"manual_seat_{tnum}")
+                seat_btn = st.button("Seat Selected / Manual", key=f"seat_now_{tnum}")
+                if seat_btn:
+                    server_name = server_for_section or None
+                    if selected_idx is not None:
+                        seat_table_callback(tnum, server_name, selected_waitlist_idx=selected_idx, manual_name=None)
+                    else:
+                        seat_table_callback(tnum, server_name, selected_waitlist_idx=None, manual_name=manual_party if manual_party else None)
+                    st.experimental_rerun()
             else:
-                cls = "available"
-                emoji = "⚪️"
+                st.info("Selected table not found in state.")
+        else:
+            st.info("Click a table in the visual layout to select it for manual seating or inspection.")
 
-            title = f"Table {tnum} | Section {section} | Server: {server_display} | Status: {status}"
-            href = f"?table_click={tnum}"
-
-            # Section color for label (choose from palette)
-            SECTION_COLORS = ["#a8d0e6", "#f7d794", "#f6b93b", "#f8a5c2", "#c7ecee", "#d6a2e8", "#b8e994", "#f6e58d", "#badc58"]
-            sec_color = SECTION_COLORS[(section - 1) % len(SECTION_COLORS)] if isinstance(section, int) and section >= 1 else "#dddddd"
-
-            # Draw the button
-            st.markdown(
-                f"""
-                <a class="table-button {cls}" href="{href}" title="{title}" style="left:{left_px}px; top:{top_px}px;">
-                    {emoji}<br/><span style="font-size:11px">{tnum}</span>
-                </a>
-                """,
-                unsafe_allow_html=True,
-            )
-        st.markdown("</div>", unsafe_allow_html=True)
-    else:
-        st.info("Floorplan image not available; switching to textual layout.")
+    with col_b:
+        st.write("Quick actions:")
+        if st.button("Clear selected table"):
+            if st.session_state["last_clicked_table"]:
+                clear_table_callback(st.session_state["last_clicked_table"])
+                st.session_state["last_clicked_table"] = None
+                st.experimental_rerun()
+        if st.button("Mark selected table Bussing"):
+            if st.session_state["last_clicked_table"]:
+                bus_table_callback(st.session_state["last_clicked_table"])
+                st.experimental_rerun()
