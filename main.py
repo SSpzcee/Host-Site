@@ -22,6 +22,7 @@ from typing import List, Dict, Optional
 from flask import Flask, render_template_string, request, jsonify, send_from_directory
 import gspread
 from google.oauth2 import service_account
+from google.oauth2.service_account import Credentials
 
 scope = ["https://www.googleapis.com/auth/spreadsheets"]
 
