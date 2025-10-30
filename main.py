@@ -29,27 +29,31 @@ app = Flask(__name__)
 # GOOGLE SHEETS SETUP
 # -------------------------
 # Load the credentials from the environment variable (Render dashboard)
-creds_json = os.getenv("GOOGLE_CREDS")
+def get_gspread_client():
+    # Get the environment variable safely
+    gcp_json = os.environ.get("GCP_SERVICE_ACCOUNT_JSON")
 
-if not creds_json:
-    raise ValueError("❌ GOOGLE_CREDS environment variable not found. Make sure it’s set in Render.")
+    if not gcp_json:
+        raise ValueError("Environment variable GCP_SERVICE_ACCOUNT_JSON is not set.")
 
-# Parse the JSON string into a dictionary
-creds_dict = json.loads(creds_json)
+    try:
+        # Convert stringified JSON into a dictionary
+        creds_dict = json.loads(gcp_json)
 
-# Define proper scopes (must include both Sheets + Drive)
-scope = [
-    "https://www.googleapis.com/auth/spreadsheets",
-    "https://www.googleapis.com/auth/drive"
-]
+        # Define the scopes your app needs
+        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
 
-# Authenticate
-creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
-client = gspread.authorize(creds)
+        # Build credentials and return a client
+        creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
+        client = gspread.authorize(creds)
+        return client
 
-# Open your sheet (replace with your actual sheet name)
-sheet = client.open("Hosting Sheet").sheet1
-SHEET_NAME = os.getenv("SHEET_NAME", "My Data Sheet")
+    except Exception as e:
+        raise RuntimeError(f"Error initializing Google Sheets client: {e}")
+
+# Initialize Google Sheets client once
+gc = get_gspread_client()
+sheet = gc.open("Hosting Sheet").sheet1  # replace with your actual sheet name
 
 # -------------------
 # Google Sheets init
