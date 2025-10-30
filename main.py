@@ -13,28 +13,41 @@ Features:
   - SHEET_NAME               : spreadsheet title
 """
 
-import os
-import json
 import time
 import threading
 from typing import List, Dict, Optional
 
-from flask import Flask, render_template_string, request, jsonify, send_from_directory
+from flask import Flask, render_template, request, redirect, url_for, jsonify
+import os
+import json
 import gspread
-from google.oauth2 import service_account
 from google.oauth2.service_account import Credentials
 
+app = Flask(__name__)
+
+# -------------------------
+# GOOGLE SHEETS SETUP
+# -------------------------
+# Load the credentials from the environment variable (Render dashboard)
+creds_json = os.getenv("GOOGLE_CREDS")
+
+if not creds_json:
+    raise ValueError("❌ GOOGLE_CREDS environment variable not found. Make sure it’s set in Render.")
+
+# Parse the JSON string into a dictionary
+creds_dict = json.loads(creds_json)
+
+# Define proper scopes (must include both Sheets + Drive)
 scope = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive"
 ]
+
+# Authenticate
 creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
-
-
-# Load credentials from environment variable
-creds_dict = json.loads(os.environ["GOOGLE_CREDS"])
 client = gspread.authorize(creds)
 
+# Open your sheet (replace with your actual sheet name)
 sheet = client.open("YOUR_SHEET_NAME").sheet1
 
 # -------------------
