@@ -17,7 +17,7 @@ import time
 import threading
 from typing import List, Dict, Optional
 
-from flask import Flask, render_template, request, redirect, url_for, jsonify
+from flask import Flask, render_template, request, redirect, url_for, jsonify, render_template_string
 import os
 import json
 import gspread
