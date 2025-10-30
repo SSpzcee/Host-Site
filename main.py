@@ -1,207 +1,95 @@
-import json
-import os
-from pathlib import Path
-import time
-from typing import List, Dict
+#!/usr/bin/env python3
+"""
+Flask-based Host Coordinating app (single-file).
 
-import pandas as pd
-import streamlit as st
-from streamlit_autorefresh import st_autorefresh
+Features:
+- Visual floor layout with 41 tables positioned by normalized coordinates.
+- Table status cycles: Available -> Taken -> Bussing -> Available
+- Seat from waitlist or manual name, increment server score when seating.
+- Sections adapt by seating plan (2-9) and display server name in each section.
+- Persistent state stored as JSON in cell A1 of a Google Sheet via gspread.
+- Credentials pulled from environment variables:
+  - GCP_SERVICE_ACCOUNT_JSON : JSON string with your service account (full dict)
+  - SHEET_NAME               : spreadsheet title
+"""
+
+import os
+import json
+import time
+import threading
+from typing import List, Dict, Optional
+
+from flask import Flask, render_template_string, request, jsonify, send_from_directory
 import gspread
 from google.oauth2 import service_account
 
-st.set_page_config(page_title="Coordinating", layout="wide")
+# -------------------
+# Configuration
+# -------------------
+# Required environment variables:
+# - GCP_SERVICE_ACCOUNT_JSON: the entire service account JSON as a string (or path to file)
+# - SHEET_NAME: the Google Spreadsheet name to use (sheet must be accessible by the service account)
+#
+# Example (Linux):
+# export GCP_SERVICE_ACCOUNT_JSON='{"type": "...", ... }'
+# export SHEET_NAME='MyCoordinatingSheet'
+#
+# Alternative: set GCP_SERVICE_ACCOUNT_JSON_PATH to a path containing the JSON.
+GCP_SERVICE_ACCOUNT_JSON = os.environ.get("GCP_SERVICE_ACCOUNT_JSON")
+GCP_SERVICE_ACCOUNT_JSON_PATH = os.environ.get("GCP_SERVICE_ACCOUNT_JSON_PATH")
+SHEET_NAME = os.environ.get("SHEET_NAME") or os.environ.get("GCP_SHEET_NAME") or "HostCoordinating"
 
-# --- Google Sheets setup ---
-SHEET_NAME = st.secrets["gcp_service_account"]["sheet_name"]
+if not (GCP_SERVICE_ACCOUNT_JSON or GCP_SERVICE_ACCOUNT_JSON_PATH):
+    raise RuntimeError(
+        "Missing credentials: set GCP_SERVICE_ACCOUNT_JSON (JSON string) or GCP_SERVICE_ACCOUNT_JSON_PATH (path)"
+    )
 
-# Authenticate using secrets
-creds = service_account.Credentials.from_service_account_info(
-    st.secrets["gcp_service_account"],
-    scopes=["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"],
-)
-gc = gspread.authorize(creds)
+# -------------------
+# Google Sheets init
+# -------------------
+def get_gspread_client():
+    if GCP_SERVICE_ACCOUNT_JSON:
+        info = json.loads(GCP_SERVICE_ACCOUNT_JSON)
+        creds = service_account.Credentials.from_service_account_info(
+            info,
+            scopes=["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"],
+        )
+    else:
+        creds = service_account.Credentials.from_service_account_file(
+            GCP_SERVICE_ACCOUNT_JSON_PATH,
+            scopes=["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"],
+        )
+    return gspread.authorize(creds)
 
-# Try opening the sheet; if it doesn't exist, create it
+
+gc = get_gspread_client()
 try:
     sh = gc.open(SHEET_NAME)
 except gspread.SpreadsheetNotFound:
     sh = gc.create(SHEET_NAME)
-    sh.share(
-        st.secrets["gcp_service_account"]["client_email"],
-        perm_type="user",
-        role="writer",
-    )
+    # try to share with client_email if available
+    try:
+        sa_email = (
+            json.loads(GCP_SERVICE_ACCOUNT_JSON)["client_email"]
+            if GCP_SERVICE_ACCOUNT_JSON
+            else None
+        )
+        if sa_email:
+            sh.share(sa_email, perm_type="user", role="writer")
+    except Exception:
+        pass
+
 ws = sh.sheet1
 
-# --- Persistence config (Google Sheets) ---
-def load_persistent_state():
-    try:
-        data = ws.get_all_values()
-        if data and data[0] and data[0][0]:
-            raw = data[0][0]
-            json_data = json.loads(raw)
-            for k, v in json_data.items():
-                # restore present_servers as set
-                if k == "present_servers" and isinstance(v, list):
-                    st.session_state[k] = set(v)
-                else:
-                    st.session_state[k] = v
-    except Exception as e:
-        # don't crash the app on load errors
-        print("Failed to load persistent state:", e)
+# -------------------
+# App & Locking
+# -------------------
+app = Flask(__name__, static_folder="static", static_url_path="/static")
+state_lock = threading.Lock()
 
-
-def save_persistent_state():
-    try:
-        keys = [
-            "waitlist",
-            "servers",
-            "present_servers",
-            "tables",
-            "seating_rotation",
-            "server_scores",
-            "seating_direction",
-            "last_sat_server",
-        ]
-        data = {}
-        for k in keys:
-            if k in st.session_state:
-                v = st.session_state[k]
-                # JSON can't encode sets; convert to list
-                if isinstance(v, set):
-                    v = list(v)
-                data[k] = v
-        json_str = json.dumps(data, ensure_ascii=False)
-        ws.update("A1", [[json_str]])
-    except Exception as e:
-        print("Failed to save persistent state:", e)
-
-
-# --- Callbacks (use on_click to avoid double-click issues) ---
-def _remove_mark_callback(server_name: str, section_idx: int):
-    cur = st.session_state["server_scores"].get(server_name, 0)
-    if cur > 0:
-        st.session_state["server_scores"][server_name] = cur - 1
-    st.session_state[f"remove_mark_msg_{section_idx}"] = server_name
-    save_persistent_state()
-
-
-def _skip_server_callback(server_name: str, section_idx: int):
-    # increment by 1 only
-    st.session_state["server_scores"].setdefault(server_name, 0)
-    st.session_state["server_scores"][server_name] += 1
-    st.session_state[f"skip_msg_{section_idx}"] = server_name
-    save_persistent_state()
-
-
-def seat_table_callback(table_num: int, server_name: str, selected_waitlist_idx: int | None = None, manual_name: str | None = None):
-    """
-    Seat either the selected waitlist person (selected_waitlist_idx) or the manual_name at table_num.
-    If selected_waitlist_idx is provided, remove that person from the waitlist.
-    This function updates table status and server score.
-    """
-    this_table = next((t for t in st.session_state["tables"] if t["table"] == table_num), None)
-    if this_table is None:
-        st.session_state[f"seat_msg_{table_num}"] = "Table not found"
-        return
-
-    # increment server score once for seating
-    if server_name:
-        st.session_state["server_scores"].setdefault(server_name, 0)
-        st.session_state["server_scores"][server_name] += 1
-        st.session_state["last_sat_server"] = server_name
-
-    if selected_waitlist_idx is not None and 0 <= selected_waitlist_idx < len(st.session_state["waitlist"]):
-        guest = st.session_state["waitlist"].pop(selected_waitlist_idx)
-        this_table["status"] = "Taken"
-        this_table["party"] = guest["name"]
-        this_table["server"] = server_name
-        st.session_state[f"seat_msg_{table_num}"] = f"Seated {guest['name']} at Table {table_num}."
-    elif manual_name:
-        this_table["status"] = "Taken"
-        this_table["party"] = manual_name
-        this_table["server"] = server_name
-        st.session_state[f"seat_msg_{table_num}"] = f"Seated {manual_name} at Table {table_num}."
-    else:
-        # If nothing chosen, still mark as taken with unknown party
-        this_table["status"] = "Taken"
-        this_table["party"] = "Unknown Party"
-        this_table["server"] = server_name
-        st.session_state[f"seat_msg_{table_num}"] = f"Seated Unknown Party at Table {table_num}."
-
-    save_persistent_state()
-
-
-def bus_table_callback(table_num: int):
-    for table in st.session_state["tables"]:
-        if table["table"] == table_num:
-            table["status"] = "Bussing"
-            st.session_state[f"bus_msg_{table_num}"] = f"Table {table_num} marked as Bussing."
-            save_persistent_state()
-            return
-    st.session_state[f"bus_msg_{table_num}"] = "Table not found"
-
-
-def clear_table_callback(table_num: int):
-    for table in st.session_state["tables"]:
-        if table["table"] == table_num:
-            table["status"] = "Available"
-            table["party"] = None
-            table["server"] = None
-            st.session_state[f"clear_msg_{table_num}"] = f"Table {table_num} is now available."
-            save_persistent_state()
-            return
-    st.session_state[f"clear_msg_{table_num}"] = "Table not found"
-
-
-def remove_waitlist_callback():
-    idx = st.session_state.get("remove_waitlist_idx", 1) - 1
-    if 0 <= idx < len(st.session_state["waitlist"]):
-        removed = st.session_state["waitlist"].pop(idx)
-        st.session_state["remove_waitlist_msg"] = f"Removed {removed['name']} from waitlist."
-        save_persistent_state()
-    else:
-        st.session_state["remove_waitlist_msg"] = "Invalid index"
-
-
-def remove_server_callback():
-    idx = st.session_state.get("remove_server_idx", 1) - 1
-    if 0 <= idx < len(st.session_state["servers"]):
-        removed = st.session_state["servers"].pop(idx)
-        st.session_state["present_servers"].discard(removed["name"])
-        if removed["name"] in st.session_state["server_scores"]:
-            del st.session_state["server_scores"][removed["name"]]
-        num_sections = min(max(len(st.session_state["servers"]), 1), 9)
-        st.session_state["tables"] = initialize_tables(num_sections)
-        st.session_state["remove_server_msg"] = f"Removed server {removed['name']} from section {removed['section']}."
-        save_persistent_state()
-    else:
-        st.session_state["remove_server_msg"] = "Invalid server index"
-
-
-# --- Session State Initialization ---
-load_persistent_state()
-
-if "waitlist" not in st.session_state:
-    st.session_state["waitlist"] = []
-if "servers" not in st.session_state:
-    st.session_state["servers"] = []
-if "present_servers" not in st.session_state:
-    st.session_state["present_servers"] = set()
-if "seating_direction" not in st.session_state:
-    st.session_state["seating_direction"] = "Up"
-if "seating_rotation" not in st.session_state:
-    st.session_state["seating_rotation"] = []
-if "last_sat_server" not in st.session_state:
-    st.session_state["last_sat_server"] = None
-if "server_scores" not in st.session_state or not isinstance(st.session_state["server_scores"], dict):
-    st.session_state["server_scores"] = {}
-# track last table clicked for the seat-from-waitlist panel
-if "last_clicked_table" not in st.session_state:
-    st.session_state["last_clicked_table"] = None
-
-# --- Table Plan Definitions ---
+# -------------------
+# Table plans & positions (normalized)
+# -------------------
 TABLE_PLANS = {
     2: [
         [31, 32, 33, 34, 35, 36, 37, 41, 42, 43],
@@ -265,515 +153,656 @@ TABLE_PLANS = {
     ],
 }
 
+# normalized coordinates based on the photo (0..1)
+TABLE_POSITIONS = {
+    1: {"x": 0.06, "y": 0.20},
+    2: {"x": 0.12, "y": 0.20},
+    3: {"x": 0.18, "y": 0.20},
+    4: {"x": 0.24, "y": 0.20},
+    5: {"x": 0.30, "y": 0.20},
+    6: {"x": 0.36, "y": 0.26},
+    7: {"x": 0.50, "y": 0.14},
+    8: {"x": 0.58, "y": 0.14},
+    9: {"x": 0.66, "y": 0.14},
+    10: {"x": 0.74, "y": 0.14},
+    11: {"x": 0.82, "y": 0.20},
+    21: {"x": 0.06, "y": 0.33},
+    22: {"x": 0.12, "y": 0.33},
+    23: {"x": 0.18, "y": 0.33},
+    24: {"x": 0.24, "y": 0.33},
+    25: {"x": 0.30, "y": 0.33},
+    26: {"x": 0.50, "y": 0.40},
+    27: {"x": 0.58, "y": 0.40},
+    28: {"x": 0.66, "y": 0.40},
+    29: {"x": 0.74, "y": 0.40},
+    30: {"x": 0.82, "y": 0.40},
+    31: {"x": 0.44, "y": 0.08},
+    32: {"x": 0.52, "y": 0.08},
+    33: {"x": 0.60, "y": 0.08},
+    34: {"x": 0.68, "y": 0.08},
+    35: {"x": 0.76, "y": 0.08},
+    36: {"x": 0.84, "y": 0.08},
+    37: {"x": 0.92, "y": 0.08},
+    41: {"x": 0.40, "y": 0.12},
+    42: {"x": 0.48, "y": 0.12},
+    43: {"x": 0.56, "y": 0.12},
+    51: {"x": 0.14, "y": 0.60},
+    52: {"x": 0.22, "y": 0.60},
+    53: {"x": 0.30, "y": 0.60},
+    54: {"x": 0.38, "y": 0.60},
+    55: {"x": 0.46, "y": 0.60},
+    61: {"x": 0.70, "y": 0.60},
+    62: {"x": 0.76, "y": 0.60},
+    63: {"x": 0.82, "y": 0.60},
+    64: {"x": 0.88, "y": 0.60},
+    65: {"x": 0.94, "y": 0.60},
+}
+for t in range(1, 66):
+    if t not in TABLE_POSITIONS:
+        TABLE_POSITIONS[t] = {"x": 0.5, "y": 0.5}
+
+# -------------------
+# State (in-memory mirror of sheet)
+# -------------------
+DEFAULT_KEYS = [
+    "waitlist",
+    "servers",
+    "present_servers",
+    "tables",
+    "seating_rotation",
+    "server_scores",
+    "seating_direction",
+    "last_sat_server",
+]
+
+def default_state():
+    # default minimal state
+    num_sections = 3
+    tables = []
+    plan = get_plan_tables(num_sections)
+    for idx, sec in enumerate(plan):
+        for t in sec:
+            tables.append({"table": t, "section": idx + 1, "status": "Available", "server": None, "party": None})
+    return {
+        "waitlist": [],
+        "servers": [],
+        "present_servers": [],
+        "tables": tables,
+        "seating_rotation": [],
+        "server_scores": {},
+        "seating_direction": "Up",
+        "last_sat_server": None,
+    }
+
+def read_state_from_sheet() -> Dict:
+    """Read JSON payload from A1"""
+    try:
+        val = ws.acell("A1").value
+        if not val:
+            return default_state()
+        return json.loads(val)
+    except Exception as e:
+        print("read_state_from_sheet error:", e)
+        return default_state()
+
+def write_state_to_sheet(state: Dict):
+    """Write JSON to A1"""
+    try:
+        ws.update("A1", [[json.dumps(state, ensure_ascii=False)]])
+    except Exception as e:
+        print("write_state_to_sheet error:", e)
+
+# load initial state
+with state_lock:
+    STATE = read_state_from_sheet()
+
+# -------------------
+# Helper utils
+# -------------------
+def persist_state():
+    with state_lock:
+        write_state_to_sheet(STATE)
 
 def get_plan_tables(num_sections: int):
     plan = TABLE_PLANS.get(num_sections)
     if not plan:
-        all_tables = sum(TABLE_PLANS[3], [])
-        return [[t for t in all_tables]]
+        # fallback to 3-plan flattened
+        flat = []
+        for sec in TABLE_PLANS[3]:
+            flat += sec
+        return [flat]
     return plan
-
 
 def initialize_tables(num_sections: int):
     plan = get_plan_tables(num_sections)
     tables = []
-    for section_idx, table_nums in enumerate(plan):
-        for tnum in table_nums:
-            tables.append({"table": tnum, "section": section_idx + 1, "status": "Available", "server": None, "party": None})
+    for idx, sec in enumerate(plan):
+        for t in sec:
+            tables.append({"table": t, "section": idx + 1, "status": "Available", "server": None, "party": None})
     return tables
 
+# -------------------
+# API endpoints
+# -------------------
 
-# Ensure tables exist
-if "tables" not in st.session_state:
-    num_sections = min(max(len(st.session_state["servers"]), 1), 9)
-    st.session_state["tables"] = initialize_tables(num_sections)
+@app.route("/api/state", methods=["GET"])
+def api_get_state():
+    """Return current STATE"""
+    with state_lock:
+        return jsonify(STATE)
 
-
-st.title("Host Coordinating")
-tab1, tab2, tab3 = st.tabs(["Waitlist", "Servers & Sections", "Seating Chart"])
-
-
-# --- Waitlist Tab ---
-with tab1:
-    st.header("Waitlist")
-    with st.form("Add to Waitlist"):
-        name = st.text_input("Guest Name")
-        party_size = st.number_input("Party Size", min_value=1, max_value=20, value=2)
-        phone = st.text_input("Phone (optional) — digits only, include country code if needed")
-        notes = st.text_input("Notes (optional)")
-        min_wait = st.number_input("Minimum Wait (minutes)", min_value=0, max_value=180, value=0)
-        max_wait = st.number_input("Maximum Wait (minutes)", min_value=0, max_value=180, value=30)
-        submitted = st.form_submit_button("Add to Waitlist")
-        if submitted and name:
-            st.session_state["waitlist"].append(
-                {
-                    "name": name,
-                    "party_size": party_size,
-                    "phone": phone,
-                    "notes": notes,
-                    "added_time": time.time(),
-                    "min_wait": min_wait,
-                    "max_wait": max_wait,
-                }
-            )
-            save_persistent_state()
-            st.success(f"Added {name} (Party of {party_size}) to waitlist.")
-
-    st_autorefresh(interval=30 * 1000, key="waitlist_autorefresh")
-
-    if st.session_state["waitlist"]:
-        st.write("### Current Waitlist:")
-        now = time.time()
-        for i, guest in enumerate(st.session_state["waitlist"]):
-            wait_mins = int((now - guest.get("added_time", now)) // 60)
-            min_wait = guest.get("min_wait", 0)
-            max_wait = guest.get("max_wait", 0)
-            phone_display = guest.get("phone") or "No phone"
-            if wait_mins < min_wait:
-                indicator = f"🟢 Can wait longer ({min_wait - wait_mins} min left)"
-            elif wait_mins >= max_wait:
-                indicator = f"🔴 Must be seated now! ({wait_mins} min)"
-            else:
-                indicator = f"🟡 Should be seated soon ({max_wait - wait_mins} min left)"
-            st.write(
-                f"{i+1}. {guest['name']} (Party of {guest['party_size']}) - {guest['notes']} | Phone: {phone_display} | Wait: {wait_mins} min | Min: {min_wait} | Max: {max_wait} | {indicator}"
-            )
-
-        remove_idx = st.number_input(
-            "Remove guest # (optional)",
-            min_value=1,
-            max_value=len(st.session_state["waitlist"]),
-            step=1,
-            value=1,
-            key="remove_waitlist_idx",
-        )
-        st.button("Remove from Waitlist", on_click=remove_waitlist_callback, key="remove_from_waitlist_btn")
-        remove_msg = st.session_state.pop("remove_waitlist_msg", None)
-        if remove_msg:
-            st.success(remove_msg)
-    else:
-        st.info("Waitlist is empty.")
-
-
-# --- Servers & Sections Tab ---
-with tab2:
-    st.header("Servers & Sections")
-    with st.form("Add Server"):
-        server_name = st.text_input("Server Name")
-        current_sections = [s["section"] for s in st.session_state["servers"]]
-        next_section = max(current_sections, default=0) + 1 if len(current_sections) < 9 else None
-        add_server = st.form_submit_button("Add Server")
-        if add_server and server_name:
-            if next_section is not None:
-                st.session_state["servers"].append({"name": server_name, "section": next_section})
-                st.session_state["server_scores"].setdefault(server_name, 0)
-                num_sections = min(max(len(st.session_state["servers"]), 1), 9)
-                st.session_state["tables"] = initialize_tables(num_sections)
-                save_persistent_state()
-                st.success(f"Added server {server_name} to section {next_section}.")
-            else:
-                st.error("Maximum number of servers (9) reached.")
-
-    st.write("### Seating Chart Direction:")
-    direction = st.radio(
-        "Choose seating chart direction:",
-        options=["Up", "Down"],
-        index=0 if st.session_state.get("seating_direction", "Up") == "Up" else 1,
-        key="seating_direction_radio",
-    )
-    if st.session_state.get("seating_direction") != direction:
-        st.session_state["seating_direction"] = direction
-        save_persistent_state()
-
-    if st.session_state["servers"]:
-        st.write("### Mark Present Servers:")
-        all_server_names = [s["name"] for s in st.session_state["servers"]]
-        present = st.multiselect(
-            "Select servers who are present:",
-            options=all_server_names,
-            default=list(st.session_state["present_servers"]),
-            key="present_servers_select",
-        )
-        new_present_set = set(present)
-        if st.session_state.get("present_servers") != new_present_set:
-            st.session_state["present_servers"] = new_present_set
-            for name in new_present_set:
-                st.session_state["server_scores"].setdefault(name, 0)
-            save_persistent_state()
-
-    if st.session_state["servers"]:
-        st.write("### Current Servers:")
-        for idx, s in enumerate(st.session_state["servers"]):
-            st.write(f"{idx+1}. {s['name']} (Section {s['section']})")
-
-        remove_idx = st.number_input(
-            "Remove server # (optional)",
-            min_value=1,
-            max_value=len(st.session_state["servers"]),
-            step=1,
-            value=1,
-            key="remove_server_idx",
-        )
-        st.button("Remove Server", on_click=remove_server_callback, key="remove_server_btn")
-        server_msg = st.session_state.pop("remove_server_msg", None)
-        if server_msg:
-            st.success(server_msg)
-    else:
-        st.info("No servers added yet.")
-
-
-# --- Seating Chart Tab ---
-with tab3:
-    st.header("Seating Chart")
-    st.write("#### Table Status:")
-
-    num_sections = min(max(len(st.session_state["servers"]), 1), 9)
-    present_server_names = st.session_state.get("present_servers", set())
-    present_servers = [s for s in st.session_state["servers"] if s["name"] in present_server_names]
-    present_servers_sorted = sorted(present_servers, key=lambda s: s["section"])
-    direction = st.session_state.get("seating_direction", "Up")
-    if direction == "Down":
-        present_servers_sorted = list(reversed(present_servers_sorted))
-
-    current_rotation = [s["name"] for s in present_servers_sorted]
-    if st.session_state.get("seating_rotation") != current_rotation:
-        st.session_state["seating_rotation"] = current_rotation
-        st.session_state["last_sat_server"] = None
-        save_persistent_state()
-
-    for k in list(st.session_state["server_scores"].keys()):
-        if k not in current_rotation:
-            del st.session_state["server_scores"][k]
-    for k in current_rotation:
-        st.session_state["server_scores"].setdefault(k, 0)
-
-    debug_data: List[Dict] = []
-    for s in present_servers_sorted:
-        debug_data.append(
-            {"Server": s["name"], "Section": s["section"], "Amount of Tables": st.session_state["server_scores"].get(s["name"], 0)}
-        )
-    if debug_data:
-        st.markdown("#### Server Rotation & Scores")
-        st.table(pd.DataFrame(debug_data))
-
-    waitlist = st.session_state["waitlist"]
-    suggestion = None
-    rotation = st.session_state.get("seating_rotation", [])
-    rotation = [s for s in rotation if s in present_server_names]
-    if rotation:
-        for s in rotation:
-            st.session_state["server_scores"].setdefault(s, 0)
-        min_score = min(st.session_state["server_scores"][s] for s in rotation)
-        suggestion_candidates = [s for s in rotation if st.session_state["server_scores"][s] == min_score]
-        if suggestion_candidates:
-            suggestion = suggestion_candidates[0]
-
-    st.markdown("### Seating Suggestion")
-    if suggestion:
-        if waitlist:
-            st.info(f"Seat next party ({waitlist[0]['name']}) with server: {suggestion}")
-        else:
-            st.info(f"Next server to be sat: {suggestion}")
-    else:
-        st.info("No suggestion available.")
-
-    # ----------------------------
-    # VISUAL LAYOUT (NO IMAGE) — normalized positions
-    # ----------------------------
-
-    # Default table positions (normalized percentages). These match your photo layout conceptually.
-    # Edit the percentages to fine-tune positions; values are 0.0..1.0 (left/top).
-    TABLE_POSITIONS = {
-        31: {"x_pct": 0.08, "y_pct": 0.08},
-        32: {"x_pct": 0.16, "y_pct": 0.08},
-        33: {"x_pct": 0.24, "y_pct": 0.08},
-        34: {"x_pct": 0.32, "y_pct": 0.08},
-        35: {"x_pct": 0.40, "y_pct": 0.08},
-        36: {"x_pct": 0.48, "y_pct": 0.08},
-        37: {"x_pct": 0.56, "y_pct": 0.08},
-        41: {"x_pct": 0.64, "y_pct": 0.08},
-        42: {"x_pct": 0.72, "y_pct": 0.08},
-        43: {"x_pct": 0.80, "y_pct": 0.08},
-
-        1: {"x_pct": 0.08, "y_pct": 0.28},
-        2: {"x_pct": 0.18, "y_pct": 0.28},
-        3: {"x_pct": 0.28, "y_pct": 0.28},
-        4: {"x_pct": 0.38, "y_pct": 0.28},
-        5: {"x_pct": 0.48, "y_pct": 0.28},
-        6: {"x_pct": 0.58, "y_pct": 0.28},
-        7: {"x_pct": 0.68, "y_pct": 0.28},
-        8: {"x_pct": 0.78, "y_pct": 0.28},
-        9: {"x_pct": 0.88, "y_pct": 0.28},
-        10: {"x_pct": 0.96, "y_pct": 0.28},
-        11: {"x_pct": 0.92, "y_pct": 0.36},
-
-        21: {"x_pct": 0.08, "y_pct": 0.36},
-        22: {"x_pct": 0.18, "y_pct": 0.36},
-        23: {"x_pct": 0.28, "y_pct": 0.36},
-        24: {"x_pct": 0.38, "y_pct": 0.36},
-        25: {"x_pct": 0.48, "y_pct": 0.36},
-        26: {"x_pct": 0.58, "y_pct": 0.36},
-        27: {"x_pct": 0.68, "y_pct": 0.36},
-        28: {"x_pct": 0.78, "y_pct": 0.36},
-        29: {"x_pct": 0.88, "y_pct": 0.36},
-        30: {"x_pct": 0.96, "y_pct": 0.36},
-
-        51: {"x_pct": 0.14, "y_pct": 0.60},
-        52: {"x_pct": 0.24, "y_pct": 0.60},
-        53: {"x_pct": 0.34, "y_pct": 0.60},
-        54: {"x_pct": 0.44, "y_pct": 0.60},
-        55: {"x_pct": 0.54, "y_pct": 0.60},
-
-        61: {"x_pct": 0.64, "y_pct": 0.60},
-        62: {"x_pct": 0.74, "y_pct": 0.60},
-        63: {"x_pct": 0.84, "y_pct": 0.60},
-        64: {"x_pct": 0.92, "y_pct": 0.60},
-        65: {"x_pct": 0.98, "y_pct": 0.60},
+@app.route("/api/add_waitlist", methods=["POST"])
+def api_add_waitlist():
+    payload = request.json or {}
+    name = payload.get("name")
+    party_size = int(payload.get("party_size", 2))
+    phone = payload.get("phone", "")
+    notes = payload.get("notes", "")
+    min_wait = int(payload.get("min_wait", 0))
+    max_wait = int(payload.get("max_wait", 30))
+    if not name:
+        return jsonify({"ok": False, "error": "Missing name"}), 400
+    entry = {
+        "name": name,
+        "party_size": party_size,
+        "phone": phone,
+        "notes": notes,
+        "added_time": time.time(),
+        "min_wait": min_wait,
+        "max_wait": max_wait,
     }
+    with state_lock:
+        STATE["waitlist"].append(entry)
+        persist_state()
+    return jsonify({"ok": True, "entry": entry})
 
-    # ensure all tables have a position; fallback to center
-    for t in st.session_state["tables"]:
-        tnum = t["table"]
-        if tnum not in TABLE_POSITIONS:
-            TABLE_POSITIONS[tnum] = {"x_pct": 0.5, "y_pct": 0.5}
-
-    # CSS for the full-width visual layout
-    st.markdown(
-        """
-        <style>
-        .floorplan-container {
-            position: relative;
-            width: 100%;
-            height: 70vh; /* fills viewport height - adjust if you want taller/shorter */
-            border: 1px solid rgba(0,0,0,0.08);
-            background: linear-gradient(180deg, #ffffff, #fafafa);
-            margin-bottom: 12px;
-            overflow: visible;
-        }
-        .table-btn {
-            position: absolute;
-            width: 56px;
-            height: 56px;
-            line-height: 56px;
-            border-radius: 28px;
-            text-align: center;
-            font-weight: 700;
-            color: white;
-            border: 2px solid rgba(0,0,0,0.08);
-            box-shadow: 0 2px 6px rgba(0,0,0,0.12);
-            transform: translate(-50%, -50%);
-            cursor: pointer;
-            display: inline-block;
-            text-decoration: none;
-        }
-        .available { background: #2ecc71; }   /* green */
-        .taken { background: #e74c3c; }       /* red */
-        .bussing { background: #f1c40f; color: black; } /* yellow */
-        .table-label {
-            position: absolute;
-            transform: translate(-50%, -50%);
-            font-size: 11px;
-            padding: 4px 6px;
-            border-radius: 6px;
-            color: #222;
-            background: rgba(255,255,255,0.9);
-            border: 1px solid rgba(0,0,0,0.06);
-        }
-        .section-name {
-            position: absolute;
-            transform: translate(-50%, -50%);
-            padding: 6px 8px;
-            border-radius: 6px;
-            font-size: 13px;
-            font-weight: 600;
-            color: #111;
-            box-shadow: 0 1px 3px rgba(0,0,0,0.08);
-        }
-        .legend {
-            display:flex;
-            gap:12px;
-            align-items:center;
-            margin-bottom:6px;
-        }
-        .legend .item { display:flex; gap:6px; align-items:center; }
-        .legend .dot { width:16px; height:16px; border-radius:8px; }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    # Show legend and instructions
-    st.markdown(
-        """
-        <div class="legend">
-            <div class="item"><div class="dot" style="background:#2ecc71"></div>Available</div>
-            <div class="item"><div class="dot" style="background:#e74c3c"></div>Taken (clicking Available→Taken increments server score)</div>
-            <div class="item"><div class="dot" style="background:#f1c40f"></div>Bussing</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    # Compute per-plan section assignment and section label positions (average table positions)
-    plan = get_plan_tables(num_sections)
-    # plan is list of sections; compute center for each section
-    section_centers = {}
-    for idx, table_nums in enumerate(plan):
-        sec = idx + 1
-        xs = []
-        ys = []
-        for tnum in table_nums:
-            pos = TABLE_POSITIONS.get(tnum, {"x_pct": 0.5, "y_pct": 0.5})
-            xs.append(pos["x_pct"])
-            ys.append(pos["y_pct"])
-        if xs and ys:
-            section_centers[sec] = {"x_pct": sum(xs) / len(xs), "y_pct": max(0.02, sum(ys) / len(ys) - 0.08)}
+@app.route("/api/remove_waitlist", methods=["POST"])
+def api_remove_waitlist():
+    idx = int((request.json or {}).get("index", -1))
+    with state_lock:
+        if 0 <= idx < len(STATE["waitlist"]):
+            removed = STATE["waitlist"].pop(idx)
+            persist_state()
+            return jsonify({"ok": True, "removed": removed})
         else:
-            section_centers[sec] = {"x_pct": 0.5, "y_pct": 0.05}
+            return jsonify({"ok": False, "error": "Invalid index"}), 400
 
-    # Section colors palette
-    SECTION_COLORS = ["#a8d0e6", "#f7d794", "#f6b93b", "#f8a5c2", "#c7ecee", "#d6a2e8", "#b8e994", "#f6e58d", "#badc58"]
+@app.route("/api/add_server", methods=["POST"])
+def api_add_server():
+    name = (request.json or {}).get("name")
+    if not name:
+        return jsonify({"ok": False, "error": "Missing name"}), 400
+    with state_lock:
+        current_sections = [s["section"] for s in STATE["servers"]]
+        next_section = max(current_sections, default=0) + 1 if len(current_sections) < 9 else None
+        if next_section is None:
+            return jsonify({"ok": False, "error": "Maximum servers reached"}), 400
+        STATE["servers"].append({"name": name, "section": next_section})
+        STATE["server_scores"].setdefault(name, 0)
+        # re-initialize table sections count
+        num_sections = min(max(len(STATE["servers"]), 1), 9)
+        STATE["tables"] = initialize_tables(num_sections)
+        persist_state()
+    return jsonify({"ok": True})
 
-    # Create container and render layout (use HTML anchors for clicks with query param to detect)
-    st.markdown('<div class="floorplan-container" id="floorplan">', unsafe_allow_html=True)
+@app.route("/api/remove_server", methods=["POST"])
+def api_remove_server():
+    idx = int((request.json or {}).get("index", -1))
+    with state_lock:
+        if 0 <= idx < len(STATE["servers"]):
+            removed = STATE["servers"].pop(idx)
+            STATE["present_servers"] = [p for p in STATE.get("present_servers", []) if p != removed["name"]]
+            STATE["server_scores"].pop(removed["name"], None)
+            num_sections = min(max(len(STATE["servers"]), 1), 9)
+            STATE["tables"] = initialize_tables(num_sections)
+            persist_state()
+            return jsonify({"ok": True, "removed": removed})
+        return jsonify({"ok": False, "error": "Invalid index"}), 400
 
-    # Render section labels (server names)
-    for sec in range(1, num_sections + 1):
-        center = section_centers.get(sec, {"x_pct": 0.5, "y_pct": 0.05})
-        left_pct = int(center["x_pct"] * 100)
-        top_pct = int(center["y_pct"] * 100)
-        # find server assigned to this section (if any)
-        server_for_section = next((s["name"] for s in st.session_state["servers"] if s["section"] == sec), None)
-        server_display = server_for_section or "No server"
-        color = SECTION_COLORS[(sec - 1) % len(SECTION_COLORS)]
-        st.markdown(
-            f'<div class="section-name" style="left:{left_pct}%; top:{top_pct}%; background:{color}">Section {sec}<br/>{server_display}</div>',
-            unsafe_allow_html=True,
-        )
+@app.route("/api/set_present_servers", methods=["POST"])
+def api_set_present_servers():
+    names = request.json.get("present", [])
+    with state_lock:
+        STATE["present_servers"] = list(names)
+        # ensure scores exist
+        for n in names:
+            STATE["server_scores"].setdefault(n, 0)
+        persist_state()
+    return jsonify({"ok": True})
 
-    # Render table buttons
-    for t in st.session_state["tables"]:
-        tnum = t["table"]
-        pos = TABLE_POSITIONS.get(tnum, {"x_pct": 0.5, "y_pct": 0.5})
-        left_pct = pos["x_pct"] * 100
-        top_pct = pos["y_pct"] * 100
-        status = t.get("status", "Available")
-        section = t.get("section") or "-"
-        server_for_section = next((s["name"] for s in st.session_state["servers"] if s["section"] == section), None)
-        server_display = server_for_section or "No server"
-
-        if status == "Available":
-            cls = "available"
-            emoji = "🟢"
-        elif status == "Taken":
-            cls = "taken"
-            emoji = "🔴"
-        elif status == "Bussing":
-            cls = "bussing"
-            emoji = "🟡"
+@app.route("/api/click_table", methods=["POST"])
+def api_click_table():
+    """Cycle a table's status: Available -> Taken -> Bussing -> Available.
+    If moving Available->Taken, increment server score for that section's server (if present).
+    """
+    tnum = int((request.json or {}).get("table", -1))
+    with state_lock:
+        tbl = next((t for t in STATE["tables"] if t["table"] == tnum), None)
+        if not tbl:
+            return jsonify({"ok": False, "error": "Table not found"}), 404
+        old = tbl.get("status", "Available")
+        if old == "Available":
+            tbl["status"] = "Taken"
+            sec = tbl.get("section")
+            server_for_section = next((s["name"] for s in STATE["servers"] if s["section"] == sec), None)
+            if server_for_section:
+                STATE["server_scores"].setdefault(server_for_section, 0)
+                STATE["server_scores"][server_for_section] += 1
+                STATE["last_sat_server"] = server_for_section
+        elif old == "Taken":
+            tbl["status"] = "Bussing"
         else:
-            cls = "available"
-            emoji = "⚪️"
+            tbl["status"] = "Available"
+            tbl["party"] = None
+            tbl["server"] = None
+        persist_state()
+    return jsonify({"ok": True, "status": tbl["status"]})
 
-        title = f"Table {tnum} | Section {section} | Server: {server_display} | Status: {status}"
-        href = f"?table_click={tnum}"
-
-        st.markdown(
-            f'''
-            <a class="table-btn {cls}" href="{href}" title="{title}" style="left:{left_pct}%; top:{top_pct}%">
-                <div style="font-size:18px;">{tnum}</div>
-            </a>
-            ''',
-            unsafe_allow_html=True,
-        )
-
-    st.markdown('</div>', unsafe_allow_html=True)
-
-    # ----------------------------
-    # handle clicks (query param)
-    # ----------------------------
-    params = st.query_params
-    if "table_click" in params:
-        try:
-            clicked_table = int(params["table_click"][0])
-            # cycle status for clicked table immediately (user requested click cycles)
-            tbl_obj = next((x for x in st.session_state["tables"] if x["table"] == clicked_table), None)
-            if tbl_obj:
-                old = tbl_obj.get("status", "Available")
-                if old == "Available":
-                    tbl_obj["status"] = "Taken"
-                    # increment server score for that section's server
-                    sec = tbl_obj.get("section")
-                    server_for_section = next((s["name"] for s in st.session_state["servers"] if s["section"] == sec), None)
-                    if server_for_section:
-                        st.session_state["server_scores"].setdefault(server_for_section, 0)
-                        st.session_state["server_scores"][server_for_section] += 1
-                        st.session_state["last_sat_server"] = server_for_section
-                elif old == "Taken":
-                    tbl_obj["status"] = "Bussing"
+@app.route("/api/seat_table", methods=["POST"])
+def api_seat_table():
+    data = request.json or {}
+    tnum = int(data.get("table", -1))
+    wait_idx = data.get("wait_index")  # optional index
+    manual_name = data.get("manual_name")
+    with state_lock:
+        tbl = next((t for t in STATE["tables"] if t["table"] == tnum), None)
+        if not tbl:
+            return jsonify({"ok": False, "error": "Table not found"}), 404
+        sec = tbl.get("section")
+        server_for_section = next((s["name"] for s in STATE["servers"] if s["section"] == sec), None)
+        # increment server score if seating from Available
+        if tbl.get("status", "Available") == "Available" and server_for_section:
+            STATE["server_scores"].setdefault(server_for_section, 0)
+            STATE["server_scores"][server_for_section] += 1
+            STATE["last_sat_server"] = server_for_section
+        if wait_idx is not None:
+            try:
+                wait_idx = int(wait_idx)
+                if 0 <= wait_idx < len(STATE["waitlist"]):
+                    guest = STATE["waitlist"].pop(wait_idx)
+                    tbl["status"] = "Taken"
+                    tbl["party"] = guest["name"]
+                    tbl["server"] = server_for_section
+                    persist_state()
+                    return jsonify({"ok": True, "seated": guest})
                 else:
-                    tbl_obj["status"] = "Available"
-                    tbl_obj["party"] = None
-                    tbl_obj["server"] = None
-                # set last_clicked_table for optional manual seating UI
-                st.session_state["last_clicked_table"] = clicked_table
-                save_persistent_state()
-        except Exception as e:
-            print("Error processing table_click param:", e)
-        # clear param so click isn't processed repeatedly
-        st.experimental_set_query_params()
-
-    # ----------------------------
-    # Right-side control panel: seat selected table from waitlist (optional)
-    # ----------------------------
-    st.markdown("---")
-    st.subheader("Table Controls / Seat from Waitlist (optional)")
-
-    col_a, col_b = st.columns([2, 1])
-    with col_a:
-        if st.session_state["last_clicked_table"]:
-            tnum = st.session_state["last_clicked_table"]
-            st.write(f"Selected Table: **{tnum}**")
-            tbl_obj = next((x for x in st.session_state["tables"] if x["table"] == tnum), None)
-            if tbl_obj:
-                st.write(f"Current status: **{tbl_obj.get('status', 'Available')}**")
-                st.write(f"Section: **{tbl_obj.get('section')}**")
-                server_for_section = next((s["name"] for s in st.session_state["servers"] if s["section"] == tbl_obj.get("section")), None)
-                st.write(f"Server: **{server_for_section or 'No server'}**")
-
-                # Choose waitlist person to seat
-                waitlist_names = [f"{idx+1}. {g['name']} (Party {g['party_size']})" for idx, g in enumerate(st.session_state["waitlist"])]
-                selected_idx = None
-                if waitlist_names:
-                    sel = st.selectbox("Choose a guest from the waitlist to seat (optional)", options=["-- None --"] + waitlist_names, key=f"seat_select_{tnum}")
-                    if sel and sel != "-- None --":
-                        try:
-                            selected_idx = waitlist_names.index(sel)
-                        except ValueError:
-                            selected_idx = None
-
-                manual_party = st.text_input("Or enter manual party name (optional)", key=f"manual_seat_{tnum}")
-                seat_btn = st.button("Seat Selected / Manual", key=f"seat_now_{tnum}")
-                if seat_btn:
-                    server_name = server_for_section or None
-                    if selected_idx is not None:
-                        seat_table_callback(tnum, server_name, selected_waitlist_idx=selected_idx, manual_name=None)
-                    else:
-                        seat_table_callback(tnum, server_name, selected_waitlist_idx=None, manual_name=manual_party if manual_party else None)
-                    st.experimental_rerun()
-            else:
-                st.info("Selected table not found in state.")
+                    return jsonify({"ok": False, "error": "Invalid waitlist index"}), 400
+            except Exception:
+                return jsonify({"ok": False, "error": "Invalid wait_index"}), 400
+        elif manual_name:
+            tbl["status"] = "Taken"
+            tbl["party"] = manual_name
+            tbl["server"] = server_for_section
+            persist_state()
+            return jsonify({"ok": True})
         else:
-            st.info("Click a table in the visual layout to select it for manual seating or inspection.")
+            # seat unknown
+            tbl["status"] = "Taken"
+            tbl["party"] = "Unknown Party"
+            tbl["server"] = server_for_section
+            persist_state()
+            return jsonify({"ok": True})
 
-    with col_b:
-        st.write("Quick actions:")
-        if st.button("Clear selected table"):
-            if st.session_state["last_clicked_table"]:
-                clear_table_callback(st.session_state["last_clicked_table"])
-                st.session_state["last_clicked_table"] = None
-                st.experimental_rerun()
-        if st.button("Mark selected table Bussing"):
-            if st.session_state["last_clicked_table"]:
-                bus_table_callback(st.session_state["last_clicked_table"])
-                st.experimental_rerun()
+@app.route("/api/clear_table", methods=["POST"])
+def api_clear_table():
+    tnum = int((request.json or {}).get("table", -1))
+    with state_lock:
+        tbl = next((t for t in STATE["tables"] if t["table"] == tnum), None)
+        if not tbl:
+            return jsonify({"ok": False, "error": "Table not found"}), 404
+        tbl["status"] = "Available"
+        tbl["party"] = None
+        tbl["server"] = None
+        persist_state()
+    return jsonify({"ok": True})
+
+# -------------------
+# Frontend page
+# -------------------
+INDEX_HTML = """
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Host Coordinating — Visual</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <style>
+    body { font-family: Inter, system-ui, Arial; margin:0; padding:16px; background:#fafafa; color:#111; }
+    .topbar { display:flex; gap:12px; align-items:center; margin-bottom:12px; }
+    .container { display:flex; gap:12px; }
+    .left, .right { width: 360px; max-width: 360px; }
+    .main { flex:1; min-width:300px; }
+    .floor { position:relative; width:100%; height:72vh; background:white; border-radius:8px; border:1px solid rgba(0,0,0,0.06); overflow:hidden; }
+    .table { position:absolute; width:56px; height:56px; border-radius:28px; display:flex; align-items:center; justify-content:center; color:#fff; font-weight:700; cursor:pointer; transform:translate(-50%,-50%); box-shadow:0 2px 8px rgba(0,0,0,0.08); border:2px solid rgba(0,0,0,0.06); text-decoration:none; }
+    .available { background:#2ecc71; }
+    .taken { background:#e74c3c; }
+    .bussing { background:#f1c40f; color:#000; }
+    .section-label { position:absolute; padding:6px 8px; border-radius:6px; font-weight:600; color:#111; box-shadow:0 1px 3px rgba(0,0,0,0.06); transform:translate(-50%,-50%); }
+    .bar-area { position:absolute; border:2px dashed rgba(0,0,0,0.12); border-radius:8px; background:rgba(0,0,0,0.02); }
+    .controls { background:#fff; border-radius:8px; padding:12px; border:1px solid rgba(0,0,0,0.06); }
+    input, select, button { font-size:14px; padding:8px; margin:6px 0; width:100%; box-sizing:border-box; border-radius:6px; border:1px solid rgba(0,0,0,0.08); }
+    button { cursor:pointer; background:#2b8cff; color:white; border:none; }
+    .legend { display:flex; gap:8px; align-items:center; }
+    .legend div { display:flex; gap:6px; align-items:center; }
+    .legend .box { width:16px; height:16px; border-radius:4px; }
+    .small { font-size:13px; color:#555; }
+    .server-list { max-height:220px; overflow:auto; }
+  </style>
+</head>
+<body>
+  <div class="topbar">
+    <h2 style="margin:0">Host Coordinating — Visual</h2>
+    <div style="flex:1"></div>
+    <div class="legend">
+      <div><div class="box" style="background:#2ecc71"></div> Available</div>
+      <div><div class="box" style="background:#e74c3c"></div> Taken</div>
+      <div><div class="box" style="background:#f1c40f"></div> Bussing</div>
+    </div>
+  </div>
+
+  <div class="container">
+    <div class="left controls">
+      <h4>Waitlist</h4>
+      <div id="waitlist_area" class="small"></div>
+      <hr/>
+      <h4>Add to Waitlist</h4>
+      <input id="w_name" placeholder="Name"/>
+      <input id="w_party" placeholder="Party size (2)"/>
+      <input id="w_phone" placeholder="Phone (optional)"/>
+      <input id="w_notes" placeholder="Notes (optional)"/>
+      <button onclick="addWaitlist()">Add</button>
+      <hr/>
+      <h4>Servers</h4>
+      <div class="server-list" id="servers_area"></div>
+      <input id="srv_name" placeholder="Server name"/>
+      <button onclick="addServer()">Add server</button>
+      <hr/>
+      <h4>Present Servers (daily)</h4>
+      <div id="present_area"></div>
+      <button onclick="savePresent()">Save present servers</button>
+    </div>
+
+    <div class="main">
+      <div id="floor" class="floor"></div>
+      <div style="margin-top:8px">
+        <div id="selected_info" class="small">Click a table to select it.</div>
+      </div>
+    </div>
+
+    <div class="right controls">
+      <h4>Quick Actions</h4>
+      <div id="selected_controls">
+        <div class="small" id="sel_details">No table selected</div>
+        <select id="seat_select"></select>
+        <input id="manual_name" placeholder="Manual party name"/>
+        <button onclick="seatSelected()">Seat selected / manual</button>
+        <button onclick="clearSelected()">Clear selected</button>
+        <button onclick="bussSelected()">Mark bussing</button>
+      </div>
+      <hr/>
+      <h4>Seating Suggestion</h4>
+      <div id="suggestion" class="small"></div>
+    </div>
+  </div>
+
+<script>
+let STATE = null;
+let selected_table = null;
+
+function fetchState(){
+  fetch('/api/state').then(r=>r.json()).then(s=>{
+    STATE = s;
+    renderWaitlist();
+    renderServers();
+    renderFloor();
+    renderSuggestion();
+  });
+}
+
+function renderWaitlist(){
+  const el = document.getElementById('waitlist_area');
+  if(!STATE.waitlist || STATE.waitlist.length===0){
+    el.innerHTML = "<div class='small'>Waitlist empty</div>";
+    return;
+  }
+  let html = '<ol>';
+  const now = Date.now()/1000;
+  STATE.waitlist.forEach((g,i)=>{
+    const waitm = Math.floor((now - (g.added_time||now))/60);
+    html += `<li><strong>${g.name}</strong> (p:${g.party_size}) — ${g.phone || 'No phone'} — ${waitm} min</li>`;
+  });
+  html += '</ol>';
+  el.innerHTML = html;
+  // populate seat select
+  const sel = document.getElementById('seat_select');
+  sel.innerHTML = '<option value="">-- none --</option>';
+  STATE.waitlist.forEach((g,i)=>{
+    sel.innerHTML += `<option value="${i}">${i+1}. ${g.name} (p:${g.party_size})</option>`;
+  });
+}
+
+function renderServers(){
+  const el = document.getElementById('servers_area');
+  if(!STATE.servers || STATE.servers.length===0){
+    el.innerHTML = "<div class='small'>No servers</div>";
+  } else {
+    let html = '<ul class="small">';
+    STATE.servers.forEach((s,i)=>{
+      html += `<li>${i+1}. ${s.name} (Section ${s.section})</li>`;
+    });
+    html += '</ul>';
+    el.innerHTML = html;
+  }
+
+  // present servers checkboxes
+  const pres = document.getElementById('present_area');
+  pres.innerHTML = '';
+  STATE.servers.forEach(s=>{
+    const ch = document.createElement('div');
+    ch.innerHTML = `<label><input type="checkbox" value="${s.name}" ${STATE.present_servers && STATE.present_servers.indexOf(s.name)!==-1 ? 'checked':''}/> ${s.name} (sec ${s.section})</label>`;
+    pres.appendChild(ch);
+  });
+}
+
+function savePresent(){
+  const boxes = Array.from(document.querySelectorAll('#present_area input[type=checkbox]'));
+  const vals = boxes.filter(b=>b.checked).map(b=>b.value);
+  fetch('/api/set_present_servers', {
+    method:'POST',
+    headers:{'content-type':'application/json'},
+    body: JSON.stringify({present: vals})
+  }).then(()=>fetchState());
+}
+
+function renderFloor(){
+  const el = document.getElementById('floor');
+  el.innerHTML = '';
+  // draw bar area (non-clickable) - fixed region
+  const bar = document.createElement('div');
+  bar.className = 'bar-area';
+  bar.style.left = '45%'; bar.style.top = '6%';
+  bar.style.width = '40%'; bar.style.height = '18%';
+  bar.style.transform = 'translate(-50%,-50%)';
+  el.appendChild(bar);
+
+  // section labels
+  const plan = (function(){
+    const numS = Math.max(1, Math.min(9, STATE.servers.length || 3));
+    // build plan using server count
+    let plan = null;
+    try {
+      plan = {{plan_map}};
+    } catch(e){
+      plan = null;
+    }
+    return plan;
+  })();
+
+  // draw tables
+  STATE.tables.forEach(tbl=>{
+    const pos = ({{pos_map}})[tbl.table] || {x:0.5,y:0.5};
+    const node = document.createElement('a');
+    node.className = 'table ' + (tbl.status==='Available'?'available':(tbl.status==='Taken'?'taken':'bussing'));
+    node.style.left = (pos.x*100)+'%';
+    node.style.top = (pos.y*100)+'%';
+    node.innerText = tbl.table;
+    node.title = `Table ${tbl.table} | Section ${tbl.section} | Server: ${tbl.server || 'No server'} | Status: ${tbl.status}`;
+    node.onclick = (ev)=>{
+      ev.preventDefault();
+      // call API to toggle
+      fetch('/api/click_table', {
+        method:'POST',
+        headers:{'content-type':'application/json'},
+        body: JSON.stringify({table: tbl.table})
+      }).then(r=>r.json()).then(()=>fetchState());
+    };
+    el.appendChild(node);
+  });
+
+  // section labels (center computed via positions)
+  // compute centers here in JS for display of server name
+  const planTables = ({{plan_map}})[Math.max(1, Math.min(9, STATE.servers.length || 3))] || [];
+  // compute centers:
+  const sections = planTables.map((sec, idx)=>{
+    let xs = 0, ys = 0;
+    sec.forEach(t=>{
+      const p = ({{pos_map}})[t] || {x:0.5,y:0.5};
+      xs += p.x; ys += p.y;
+    });
+    const cx = (xs / sec.length) * 100;
+    const cy = (ys / sec.length) * 100 - 8;
+    return {x: cx, y: cy};
+  });
+  sections.forEach((c, idx)=>{
+    const secn = idx+1;
+    const svr = STATE.servers.find(s=>s.section===secn);
+    const label = document.createElement('div');
+    label.className = 'section-label';
+    label.style.left = c.x + '%';
+    label.style.top = c.y + '%';
+    label.style.background = ['#a8d0e6','#f7d794','#f6b93b','#f8a5c2','#c7ecee','#d6a2e8','#b8e994','#f6e58d','#badc58'][(idx)%9];
+    label.innerHTML = `Section ${secn}<br/><span style="font-weight:700">${svr ? svr.name : 'No server'}</span>`;
+    document.getElementById('floor').appendChild(label);
+  });
+
+  // update selected info if selected_table matches
+  if(selected_table){
+    const t = STATE.tables.find(x=>x.table===selected_table);
+    if(t){
+      document.getElementById('sel_details').innerText = `Selected ${selected_table} — Status: ${t.status} — Section: ${t.section} — Server: ${t.server || 'No server'}`;
+    } else {
+      document.getElementById('sel_details').innerText = `Selected ${selected_table}`;
+    }
+  }
+}
+
+function renderSuggestion(){
+  let suggestionText = 'No suggestion available.';
+  const present = STATE.present_servers || [];
+  const rotation = STATE.seating_rotation ? STATE.seating_rotation.filter(r=>present.indexOf(r)!==-1) : [];
+  if(rotation.length){
+    let minScore = Infinity;
+    rotation.forEach(s=>{
+      const sc = STATE.server_scores && STATE.server_scores[s] ? STATE.server_scores[s] : 0;
+      if(sc < minScore) minScore = sc;
+    });
+    const candidates = rotation.filter(s => (STATE.server_scores && STATE.server_scores[s] ? STATE.server_scores[s] : 0) === minScore);
+    if(candidates.length){
+      suggestionText = `Suggested server: ${candidates[0]}.`;
+      if(STATE.waitlist && STATE.waitlist.length){
+        suggestionText = `Seat next party (${STATE.waitlist[0].name}) with server: ${candidates[0]}`;
+      }
+    }
+  }
+  document.getElementById('suggestion').innerText = suggestionText;
+}
+
+function addWaitlist(){
+  const name = document.getElementById('w_name').value.trim();
+  const party = parseInt(document.getElementById('w_party').value || 2);
+  const phone = document.getElementById('w_phone').value.trim();
+  const notes = document.getElementById('w_notes').value.trim();
+  if(!name) return alert('Name required');
+  fetch('/api/add_waitlist', {
+    method:'POST', headers:{'content-type':'application/json'},
+    body: JSON.stringify({name, party_size: party, phone, notes})
+  }).then(()=>fetchState());
+}
+
+function addServer(){
+  const name = document.getElementById('srv_name').value.trim();
+  if(!name) return alert('Server name required');
+  fetch('/api/add_server', {method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({name})})
+    .then(()=>fetchState());
+}
+
+function seatSelected(){
+  if(!selected_table) return alert('Select a table from the floor first');
+  const sel = document.getElementById('seat_select').value;
+  const manual = document.getElementById('manual_name').value.trim();
+  let payload = {table: selected_table};
+  if(sel) payload.wait_index = parseInt(sel);
+  if(manual) payload.manual_name = manual;
+  fetch('/api/seat_table', {method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(payload)})
+    .then(()=>{ fetchState(); });
+}
+
+function clearSelected(){
+  if(!selected_table) return alert('Select a table');
+  fetch('/api/clear_table', {method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({table:selected_table})})
+    .then(()=>{ selected_table = null; fetchState(); });
+}
+
+function bussSelected(){ 
+  if(!selected_table) return alert('Select a table');
+  fetch('/api/click_table', {method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({table:selected_table})})
+    .then(()=>fetchState());
+}
+
+document.addEventListener('click', function(e){
+  // if clicked a table element, set selected_table
+  const el = e.target;
+  if(el.classList && el.classList.contains('table')){
+    selected_table = parseInt(el.innerText);
+    // show selected area details
+    const t = STATE.tables.find(x=>x.table===selected_table);
+    document.getElementById('sel_details').innerText = `Selected ${selected_table} — Status: ${t.status} — Section: ${t.section} — Server: ${t.server || 'No server'}`;
+    // set the seat_select dropdown to none to avoid mismatch
+    document.getElementById('seat_select').value = '';
+  }
+});
+
+fetchState();
+setInterval(fetchState, 5000); // poll every 5s
+</script>
+
+</body>
+</html>
+"""
+
+# -------------------
+# Template injection helpers
+# -------------------
+# We inject the TABLE_POSITIONS and TABLE_PLANS as JSON strings into the HTML template
+@app.route("/")
+def index():
+    template = INDEX_HTML
+    # basic injection: plan_map and pos_map placeholders replaced by JSON literals
+    plan_map_json = json.dumps({k: v for k, v in TABLE_PLANS.items()})
+    pos_map_json = json.dumps(TABLE_POSITIONS)
+    # replace the placeholders ({{plan_map}} and {{pos_map}}) safely
+    template = template.replace("{{plan_map}}", plan_map_json)
+    template = template.replace("{{pos_map}}", pos_map_json)
+    return render_template_string(template)
+
+# -------------------
+# Run
+# -------------------
+if __name__ == "__main__":
+    # ensure STATE consistency on startup
+    with state_lock:
+        # if sheet was empty/contains {}, initialize default
+        if not STATE or (isinstance(STATE, dict) and len(STATE)==0):
+            STATE = default_state()
+            write_state_to_sheet(STATE)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8501)), debug=False)
