@@ -48,7 +48,7 @@ creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
 client = gspread.authorize(creds)
 
 # Open your sheet (replace with your actual sheet name)
-sheet = client.open("YOUR_SHEET_NAME").sheet1
+sheet = client.open("Hosting Sheet").sheet1
 
 # -------------------
 # Google Sheets init
