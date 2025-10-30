@@ -72,9 +72,9 @@ def get_gspread_client():
 
 gc = get_gspread_client()
 try:
-    sh = gc.open(SHEET_NAME)
+    sh = gc.open("Hosting Sheet")
 except gspread.SpreadsheetNotFound:
-    sh = gc.create(SHEET_NAME)
+    sh = gc.create("Hosting Sheet")
     # try to share with client_email if available
     try:
         sa_email = (
