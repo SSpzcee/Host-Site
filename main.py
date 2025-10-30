@@ -49,6 +49,7 @@ client = gspread.authorize(creds)
 
 # Open your sheet (replace with your actual sheet name)
 sheet = client.open("Hosting Sheet").sheet1
+SHEET_NAME = os.getenv("SHEET_NAME", "My Data Sheet")
 
 # -------------------
 # Google Sheets init
