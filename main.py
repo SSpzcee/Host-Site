@@ -1,217 +1,54 @@
-#!/usr/bin/env python3
-"""
-Flask-based Host Coordinating app (single-file).
-
-Features:
-- Visual floor layout with 41 tables positioned by normalized coordinates.
-- Table status cycles: Available -> Taken -> Bussing -> Available
-- Seat from waitlist or manual name, increment server score when seating.
-- Sections adapt by seating plan (2-9) and display server name in each section.
-- Persistent state stored as JSON in cell A1 of a Google Sheet via gspread.
-- Credentials pulled from environment variables:
-  - GCP_SERVICE_ACCOUNT_JSON : JSON string with your service account (full dict)
-  - SHEET_NAME               : spreadsheet title
-"""
-
-import time
-import threading
-from typing import List, Dict, Optional
-
-from flask import Flask, render_template, request, redirect, url_for, jsonify, render_template_string
+# main.py
 import os
 import json
+import time
+from typing import Dict, List, Any
+from flask import Flask, jsonify, request, render_template_string, abort
 import gspread
-from google.oauth2.service_account import Credentials
 from google.oauth2 import service_account
 
 app = Flask(__name__)
 
-@app.route("/")
-def index():
-    return "Google Sheets + Flask running!"
+# ---------- Config ----------
+SHEET_NAME = os.environ.get("Hosting Sheet", "HostCoordinatingSheet")
+GCP_SERVICE_ACCOUNT_JSON = os.environ.get("GCP_SERVICE_ACCOUNT_JSON")
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8080)
+if not GCP_SERVICE_ACCOUNT_JSON:
+    raise RuntimeError("Missing environment variable GCP_SERVICE_ACCOUNT_JSON")
 
-# -------------------------
-# GOOGLE SHEETS SETUP
-# -------------------------
-# Load the credentials from the environment variable (Render dashboard)
-GCP_SERVICE_ACCOUNT_JSON = os.getenv("GCP_SERVICE_ACCOUNT_JSON")
-
+# ---------- Google Sheets helpers ----------
 def get_gspread_client():
-    if not GCP_SERVICE_ACCOUNT_JSON:
-        raise ValueError("Missing GCP_SERVICE_ACCOUNT_JSON environment variable")
-
     try:
-        service_account_info = json.loads(GCP_SERVICE_ACCOUNT_JSON)
-        gc = gspread.service_account_from_dict(service_account_info)
-        print("✅ Connected to Google Sheets successfully!")
-        return gc
-    except Exception as e:
-        print("❌ Error initializing Google Sheets client:", e)
-        raise
-
-# -------------------
-# Google Sheets init
-# -------------------
-def get_gspread_client():
-    if GCP_SERVICE_ACCOUNT_JSON:
-        info = json.loads(GCP_SERVICE_ACCOUNT_JSON)
+        creds_dict = json.loads(GCP_SERVICE_ACCOUNT_JSON)
         creds = service_account.Credentials.from_service_account_info(
-            info,
+            creds_dict,
             scopes=["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"],
         )
-    else:
-        creds = service_account.Credentials.from_service_account_file(
-            GCP_SERVICE_ACCOUNT_JSON_PATH,
-            scopes=["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"],
-        )
-    return gspread.authorize(creds)
-
+        return gspread.authorize(creds)
+    except Exception as e:
+        raise RuntimeError(f"Error initializing Google Sheets client: {e}")
 
 gc = get_gspread_client()
-try:
-    sh = gc.open("Hosting Sheet")
-except gspread.SpreadsheetNotFound:
-    sh = gc.create("Hosting Sheet")
-    # try to share with client_email if available
+
+def get_sheet():
+    """Open or create the spreadsheet and return the first worksheet."""
     try:
-        sa_email = (
-            json.loads(GCP_SERVICE_ACCOUNT_JSON)["client_email"]
-            if GCP_SERVICE_ACCOUNT_JSON
-            else None
-        )
-        if sa_email:
-            sh.share(sa_email, perm_type="user", role="writer")
-    except Exception:
-        pass
+        sh = gc.open(SHEET_NAME)
+    except gspread.SpreadsheetNotFound:
+        sh = gc.create(SHEET_NAME)
+        # Try to share with the service account email if present
+        try:
+            info = json.loads(GCP_SERVICE_ACCOUNT_JSON)
+            email = info.get("client_email")
+            if email:
+                sh.share(email, perm_type="user", role="writer")
+        except Exception:
+            pass
+    return sh.sheet1
 
-ws = sh.sheet1
+ws = get_sheet()
 
-# -------------------
-# App & Locking
-# -------------------
-app = Flask(__name__, static_folder="static", static_url_path="/static")
-state_lock = threading.Lock()
-
-# -------------------
-# Table plans & positions (normalized)
-# -------------------
-TABLE_PLANS = {
-    2: [
-        [31, 32, 33, 34, 35, 36, 37, 41, 42, 43],
-        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 51, 52, 53, 54, 55, 61, 62, 63, 64, 65],
-    ],
-    3: [
-        [31, 32, 33, 34, 35, 36, 37, 41, 42, 43],
-        [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30],
-        [51, 52, 53, 54, 55, 61, 62, 63, 64, 65],
-    ],
-    4: [
-        [31, 32, 33, 34, 35, 36, 37, 41, 42, 43],
-        [1, 2, 3, 4, 5, 6, 21, 22, 23, 24, 25],
-        [51, 52, 53, 54, 55, 61, 62, 63, 64, 65],
-        [7, 8, 9, 10, 11, 26, 27, 28, 29, 30],
-    ],
-    5: [
-        [31, 32, 33, 34, 35, 36, 37, 41, 42, 43],
-        [4, 5, 6, 7, 8, 25, 26],
-        [51, 52, 53, 54, 55, 61, 62, 63, 64, 65],
-        [9, 10, 11, 27, 28, 29, 30],
-        [1, 2, 3, 21, 22, 23, 24],
-    ],
-    6: [
-        [31, 32, 33, 34, 35],
-        [4, 5, 6, 7, 8, 25, 26],
-        [51, 52, 53, 54, 55, 61, 62, 63, 64, 65],
-        [9, 10, 11, 27, 28, 29, 30],
-        [1, 2, 3, 21, 22, 23, 24],
-        [36, 37, 41, 42, 43],
-    ],
-    7: [
-        [31, 32, 33, 34, 35],
-        [4, 5, 6, 7, 8, 25, 26],
-        [54, 55, 63, 64, 65],
-        [9, 10, 11, 27, 28, 29, 30],
-        [1, 2, 3, 21, 22, 23, 24],
-        [36, 37, 41, 42, 43],
-        [51, 52, 53, 61, 62],
-    ],
-    8: [
-        [31, 32, 33, 34, 35],
-        [4, 5, 6, 7, 24, 25],
-        [54, 55, 63, 64, 65],
-        [10, 11, 28, 29, 30],
-        [1, 2, 3, 21, 22, 23],
-        [36, 37, 41, 42, 43],
-        [51, 52, 53, 61, 62],
-        [8, 9, 26, 27],
-    ],
-    9: [
-        [31, 32, 33, 34, 35],
-        [4, 5, 6, 7, 26],
-        [54, 55, 64, 65],
-        [10, 11, 29, 30],
-        [1, 2, 21, 22],
-        [36, 37, 41, 42, 43],
-        [51, 52, 53, 61, 62, 63],
-        [8, 9, 27, 28],
-        [3, 23, 24, 25],
-    ],
-}
-
-# normalized coordinates based on the photo (0..1)
-TABLE_POSITIONS = {
-    1: {"x": 0.06, "y": 0.20},
-    2: {"x": 0.12, "y": 0.20},
-    3: {"x": 0.18, "y": 0.20},
-    4: {"x": 0.24, "y": 0.20},
-    5: {"x": 0.30, "y": 0.20},
-    6: {"x": 0.36, "y": 0.26},
-    7: {"x": 0.50, "y": 0.14},
-    8: {"x": 0.58, "y": 0.14},
-    9: {"x": 0.66, "y": 0.14},
-    10: {"x": 0.74, "y": 0.14},
-    11: {"x": 0.82, "y": 0.20},
-    21: {"x": 0.06, "y": 0.33},
-    22: {"x": 0.12, "y": 0.33},
-    23: {"x": 0.18, "y": 0.33},
-    24: {"x": 0.24, "y": 0.33},
-    25: {"x": 0.30, "y": 0.33},
-    26: {"x": 0.50, "y": 0.40},
-    27: {"x": 0.58, "y": 0.40},
-    28: {"x": 0.66, "y": 0.40},
-    29: {"x": 0.74, "y": 0.40},
-    30: {"x": 0.82, "y": 0.40},
-    31: {"x": 0.44, "y": 0.08},
-    32: {"x": 0.52, "y": 0.08},
-    33: {"x": 0.60, "y": 0.08},
-    34: {"x": 0.68, "y": 0.08},
-    35: {"x": 0.76, "y": 0.08},
-    36: {"x": 0.84, "y": 0.08},
-    37: {"x": 0.92, "y": 0.08},
-    41: {"x": 0.40, "y": 0.12},
-    42: {"x": 0.48, "y": 0.12},
-    43: {"x": 0.56, "y": 0.12},
-    51: {"x": 0.14, "y": 0.60},
-    52: {"x": 0.22, "y": 0.60},
-    53: {"x": 0.30, "y": 0.60},
-    54: {"x": 0.38, "y": 0.60},
-    55: {"x": 0.46, "y": 0.60},
-    61: {"x": 0.70, "y": 0.60},
-    62: {"x": 0.76, "y": 0.60},
-    63: {"x": 0.82, "y": 0.60},
-    64: {"x": 0.88, "y": 0.60},
-    65: {"x": 0.94, "y": 0.60},
-}
-for t in range(1, 66):
-    if t not in TABLE_POSITIONS:
-        TABLE_POSITIONS[t] = {"x": 0.5, "y": 0.5}
-
-# -------------------
-# State (in-memory mirror of sheet)
-# -------------------
+# ---------- Persistent state helpers ----------
 DEFAULT_KEYS = [
     "waitlist",
     "servers",
@@ -223,594 +60,733 @@ DEFAULT_KEYS = [
     "last_sat_server",
 ]
 
-def default_state():
-    # default minimal state
-    num_sections = 3
-    tables = []
-    plan = get_plan_tables(num_sections)
-    for idx, sec in enumerate(plan):
-        for t in sec:
-            tables.append({"table": t, "section": idx + 1, "status": "Available", "server": None, "party": None})
+def load_state_from_sheet() -> Dict[str, Any]:
+    try:
+        vals = ws.get_all_values()
+        if vals and vals[0] and vals[0][0]:
+            raw = vals[0][0]
+            state = json.loads(raw)
+            # Convert present_servers back to set for convenience
+            if "present_servers" in state and isinstance(state["present_servers"], list):
+                state["present_servers"] = set(state["present_servers"])
+            return state
+    except Exception as e:
+        app.logger.error("Failed to load state: %s", e)
+    # return default structure
     return {
         "waitlist": [],
         "servers": [],
-        "present_servers": [],
-        "tables": tables,
+        "present_servers": set(),
+        "tables": [],  # will be initialized below if empty
         "seating_rotation": [],
         "server_scores": {},
         "seating_direction": "Up",
         "last_sat_server": None,
     }
 
-def read_state_from_sheet() -> Dict:
-    """Read JSON payload from A1"""
+def save_state_to_sheet(state: Dict[str, Any]):
     try:
-        val = ws.acell("A1").value
-        if not val:
-            return default_state()
-        return json.loads(val)
+        # convert sets to lists for JSON
+        s = dict(state)
+        if isinstance(s.get("present_servers"), set):
+            s["present_servers"] = list(s["present_servers"])
+        # ensure keys present
+        for k in DEFAULT_KEYS:
+            s.setdefault(k, [] if k in ("waitlist","servers","tables","seating_rotation") else ({} if k=="server_scores" else None))
+        json_str = json.dumps(s, ensure_ascii=False)
+        ws.update("A1", [[json_str]])
     except Exception as e:
-        print("read_state_from_sheet error:", e)
-        return default_state()
+        app.logger.error("Failed to save state to sheet: %s", e)
+        raise
 
-def write_state_to_sheet(state: Dict):
-    """Write JSON to A1"""
-    try:
-        ws.update("A1", [[json.dumps(state, ensure_ascii=False)]])
-    except Exception as e:
-        print("write_state_to_sheet error:", e)
-
-# load initial state
-with state_lock:
-    STATE = read_state_from_sheet()
-
-# -------------------
-# Helper utils
-# -------------------
-def persist_state():
-    with state_lock:
-        write_state_to_sheet(STATE)
+# ---------- Table plan / initialization ----------
+TABLE_PLANS = {
+    2: [
+        [31,32,33,34,35,36,37,41,42,43],
+        [1,2,3,4,5,6,7,8,9,10,11,21,22,23,24,25,26,27,28,29,30,51,52,53,54,55,61,62,63,64,65]
+    ],
+    3: [
+        [31,32,33,34,35,36,37,41,42,43],
+        [1,2,3,4,5,6,7,8,9,10,11,21,22,23,24,25,26,27,28,29,30],
+        [51,52,53,54,55,61,62,63,64,65],
+    ],
+    4: [
+        [31,32,33,34,35,36,37,41,42,43],
+        [1,2,3,4,5,6,21,22,23,24,25],
+        [51,52,53,54,55,61,62,63,64,65],
+        [7,8,9,10,11,26,27,28,29,30],
+    ],
+    5: [
+        [31,32,33,34,35,36,37,41,42,43],
+        [4,5,6,7,8,25,26],
+        [51,52,53,54,55,61,62,63,64,65],
+        [9,10,11,27,28,29,30],
+        [1,2,3,21,22,23,24],
+    ],
+    6: [
+        [31,32,33,34,35],
+        [4,5,6,7,8,25,26],
+        [51,52,53,54,55,61,62,63,64,65],
+        [9,10,11,27,28,29,30],
+        [1,2,3,21,22,23,24],
+        [36,37,41,42,43],
+    ],
+    7: [
+        [31,32,33,34,35],
+        [4,5,6,7,8,25,26],
+        [54,55,63,64,65],
+        [9,10,11,27,28,29,30],
+        [1,2,3,21,22,23,24],
+        [36,37,41,42,43],
+        [51,52,53,61,62],
+    ],
+    8: [
+        [31,32,33,34,35],
+        [4,5,6,7,24,25],
+        [54,55,63,64,65],
+        [10,11,28,29,30],
+        [1,2,3,21,22,23],
+        [36,37,41,42,43],
+        [51,52,53,61,62],
+        [8,9,26,27],
+    ],
+    9: [
+        [31,32,33,34,35],
+        [4,5,6,7,26],
+        [54,55,64,65],
+        [10,11,29,30],
+        [1,2,21,22],
+        [36,37,41,42,43],
+        [51,52,53,61,62,63],
+        [8,9,27,28],
+        [3,23,24,25],
+    ],
+}
 
 def get_plan_tables(num_sections: int):
     plan = TABLE_PLANS.get(num_sections)
     if not plan:
-        # fallback to 3-plan flattened
-        flat = []
-        for sec in TABLE_PLANS[3]:
-            flat += sec
-        return [flat]
+        all_tables = sum(TABLE_PLANS[3], [])
+        return [[t for t in all_tables]]
     return plan
 
 def initialize_tables(num_sections: int):
     plan = get_plan_tables(num_sections)
     tables = []
-    for idx, sec in enumerate(plan):
-        for t in sec:
-            tables.append({"table": t, "section": idx + 1, "status": "Available", "server": None, "party": None})
+    for section_idx, table_nums in enumerate(plan):
+        for tnum in table_nums:
+            tables.append({
+                "table": tnum,
+                "section": section_idx + 1,
+                "status": "Available",
+                "server": None,
+                "party": None
+            })
     return tables
 
-# -------------------
-# API endpoints
-# -------------------
+# ---------- Load or initialize state ----------
+STATE = load_state_from_sheet()
 
+# Ensure tables exist
+if not STATE.get("tables"):
+    num_sections = min(max(len(STATE.get("servers", [])), 1), 9)
+    STATE["tables"] = initialize_tables(num_sections)
+    save_state_to_sheet(STATE)
+
+# Ensure types are consistent
+if "present_servers" in STATE and not isinstance(STATE["present_servers"], set):
+    STATE["present_servers"] = set(STATE["present_servers"])
+
+# ---------- Table positions (normalized percentages) ----------
+# Tweak these to match the photo. Values are x_pct, y_pct (0..1)
+TABLE_POSITIONS = {
+    # left column 1..6 (approx)
+    1: {"x": 0.08,"y":0.20},
+    2: {"x": 0.08,"y":0.28},
+    3: {"x": 0.08,"y":0.36},
+    4: {"x": 0.08,"y":0.44},
+    5: {"x": 0.08,"y":0.52},
+    6: {"x": 0.06,"y":0.12},
+
+    # top row 7-11
+    7: {"x":0.20,"y":0.10},
+    8: {"x":0.30,"y":0.10},
+    9: {"x":0.40,"y":0.10},
+    10: {"x":0.50,"y":0.10},
+    11: {"x":0.60,"y":0.10},
+
+    # 21-25 column to right of 1-5
+    21: {"x":0.20,"y":0.20},
+    22: {"x":0.20,"y":0.28},
+    23: {"x":0.20,"y":0.36},
+    24: {"x":0.20,"y":0.44},
+    25: {"x":0.20,"y":0.52},
+
+    # 26-30 below 7-11
+    26: {"x":0.30,"y":0.20},
+    27: {"x":0.40,"y":0.20},
+    28: {"x":0.50,"y":0.20},
+    29: {"x":0.60,"y":0.20},
+    30: {"x":0.70,"y":0.20},
+
+    # 31-34 column to right of 21-25 (vertical)
+    31: {"x":0.32,"y":0.45},
+    32: {"x":0.32,"y":0.55},
+    33: {"x":0.32,"y":0.65},
+    34: {"x":0.32,"y":0.35},
+
+    # 35-37 small row under 28-30
+    35: {"x":0.48,"y":0.30},
+    36: {"x":0.58,"y":0.30},
+    37: {"x":0.68,"y":0.30},
+
+    # 41-43 circulars to left of 51-53
+    41: {"x":0.78,"y":0.48},
+    42: {"x":0.78,"y":0.58},
+    43: {"x":0.78,"y":0.68},
+
+    # 51-55 left-right block
+    51: {"x":0.88,"y":0.48},
+    52: {"x":0.88,"y":0.58},
+    53: {"x":0.88,"y":0.68},
+    54: {"x":0.96,"y":0.58},
+    55: {"x":0.96,"y":0.48},
+
+    # 61-65 far right column (bottom to top)
+    61: {"x":0.98,"y":0.72},
+    62: {"x":0.98,"y":0.62},
+    63: {"x":0.98,"y":0.52},
+    64: {"x":0.98,"y":0.42},
+    65: {"x":0.98,"y":0.32},
+}
+
+# Ensure all tables exist in positions (fallback center)
+for t in STATE["tables"]:
+    if t["table"] not in TABLE_POSITIONS:
+        TABLE_POSITIONS[t["table"]] = {"x":0.5,"y":0.5}
+
+# ---------- Helper: find server for section ----------
+def server_for_section(section: int) -> str | None:
+    for s in STATE.get("servers", []):
+        if s.get("section") == section:
+            return s.get("name")
+    return None
+
+# ---------- API endpoints ----------
 @app.route("/api/state", methods=["GET"])
-def api_get_state():
-    """Return current STATE"""
-    with state_lock:
-        return jsonify(STATE)
+def api_state():
+    # Convert present_servers set to list for JSON
+    s = dict(STATE)
+    s["present_servers"] = list(s.get("present_servers", []))
+    return jsonify(s)
 
 @app.route("/api/add_waitlist", methods=["POST"])
 def api_add_waitlist():
-    payload = request.json or {}
-    name = payload.get("name")
+    payload = request.get_json()
+    name = payload.get("name", "").strip()
     party_size = int(payload.get("party_size", 2))
-    phone = payload.get("phone", "")
     notes = payload.get("notes", "")
     min_wait = int(payload.get("min_wait", 0))
     max_wait = int(payload.get("max_wait", 30))
     if not name:
-        return jsonify({"ok": False, "error": "Missing name"}), 400
-    entry = {
+        return jsonify({"error":"name required"}), 400
+    STATE["waitlist"].append({
         "name": name,
         "party_size": party_size,
-        "phone": phone,
         "notes": notes,
         "added_time": time.time(),
         "min_wait": min_wait,
-        "max_wait": max_wait,
-    }
-    with state_lock:
-        STATE["waitlist"].append(entry)
-        persist_state()
-    return jsonify({"ok": True, "entry": entry})
+        "max_wait": max_wait
+    })
+    save_state_to_sheet(STATE)
+    return jsonify({"ok":True})
 
 @app.route("/api/remove_waitlist", methods=["POST"])
 def api_remove_waitlist():
-    idx = int((request.json or {}).get("index", -1))
-    with state_lock:
-        if 0 <= idx < len(STATE["waitlist"]):
-            removed = STATE["waitlist"].pop(idx)
-            persist_state()
-            return jsonify({"ok": True, "removed": removed})
-        else:
-            return jsonify({"ok": False, "error": "Invalid index"}), 400
+    payload = request.get_json() or {}
+    idx = int(payload.get("index", 0))
+    if 0 <= idx < len(STATE["waitlist"]):
+        removed = STATE["waitlist"].pop(idx)
+        save_state_to_sheet(STATE)
+        return jsonify({"ok":True, "removed": removed})
+    return jsonify({"error":"invalid index"}), 400
 
 @app.route("/api/add_server", methods=["POST"])
 def api_add_server():
-    name = (request.json or {}).get("name")
+    payload = request.get_json()
+    name = payload.get("name", "").strip()
     if not name:
-        return jsonify({"ok": False, "error": "Missing name"}), 400
-    with state_lock:
-        current_sections = [s["section"] for s in STATE["servers"]]
-        next_section = max(current_sections, default=0) + 1 if len(current_sections) < 9 else None
-        if next_section is None:
-            return jsonify({"ok": False, "error": "Maximum servers reached"}), 400
-        STATE["servers"].append({"name": name, "section": next_section})
-        STATE["server_scores"].setdefault(name, 0)
-        # re-initialize table sections count
-        num_sections = min(max(len(STATE["servers"]), 1), 9)
-        STATE["tables"] = initialize_tables(num_sections)
-        persist_state()
-    return jsonify({"ok": True})
+        return jsonify({"error":"name required"}), 400
+    current_sections = [s["section"] for s in STATE.get("servers",[])]
+    next_section = max(current_sections, default=0) + 1 if len(current_sections) < 9 else None
+    if next_section is None:
+        return jsonify({"error":"max servers reached"}), 400
+    STATE["servers"].append({"name": name, "section": next_section})
+    STATE["server_scores"].setdefault(name, 0)
+    num_sections = min(max(len(STATE["servers"]), 1), 9)
+    STATE["tables"] = initialize_tables(num_sections)
+    save_state_to_sheet(STATE)
+    return jsonify({"ok":True})
 
 @app.route("/api/remove_server", methods=["POST"])
 def api_remove_server():
-    idx = int((request.json or {}).get("index", -1))
-    with state_lock:
-        if 0 <= idx < len(STATE["servers"]):
-            removed = STATE["servers"].pop(idx)
-            STATE["present_servers"] = [p for p in STATE.get("present_servers", []) if p != removed["name"]]
-            STATE["server_scores"].pop(removed["name"], None)
-            num_sections = min(max(len(STATE["servers"]), 1), 9)
-            STATE["tables"] = initialize_tables(num_sections)
-            persist_state()
-            return jsonify({"ok": True, "removed": removed})
-        return jsonify({"ok": False, "error": "Invalid index"}), 400
+    payload = request.get_json() or {}
+    idx = int(payload.get("index", 0))
+    if 0 <= idx < len(STATE["servers"]):
+        removed = STATE["servers"].pop(idx)
+        STATE["present_servers"].discard(removed["name"])
+        STATE["server_scores"].pop(removed["name"], None)
+        num_sections = min(max(len(STATE["servers"]), 1), 9)
+        STATE["tables"] = initialize_tables(num_sections)
+        save_state_to_sheet(STATE)
+        return jsonify({"ok":True, "removed": removed})
+    return jsonify({"error":"invalid index"}), 400
 
-@app.route("/api/set_present_servers", methods=["POST"])
-def api_set_present_servers():
-    names = request.json.get("present", [])
-    with state_lock:
-        STATE["present_servers"] = list(names)
-        # ensure scores exist
-        for n in names:
-            STATE["server_scores"].setdefault(n, 0)
-        persist_state()
-    return jsonify({"ok": True})
+@app.route("/api/mark_present", methods=["POST"])
+def api_mark_present():
+    payload = request.get_json() or {}
+    present_list = payload.get("present", [])
+    STATE["present_servers"] = set(present_list)
+    for name in STATE["present_servers"]:
+        STATE["server_scores"].setdefault(name, 0)
+    save_state_to_sheet(STATE)
+    return jsonify({"ok":True})
 
-@app.route("/api/click_table", methods=["POST"])
-def api_click_table():
-    """Cycle a table's status: Available -> Taken -> Bussing -> Available.
-    If moving Available->Taken, increment server score for that section's server (if present).
-    """
-    tnum = int((request.json or {}).get("table", -1))
-    with state_lock:
-        tbl = next((t for t in STATE["tables"] if t["table"] == tnum), None)
-        if not tbl:
-            return jsonify({"ok": False, "error": "Table not found"}), 404
-        old = tbl.get("status", "Available")
-        if old == "Available":
-            tbl["status"] = "Taken"
-            sec = tbl.get("section")
-            server_for_section = next((s["name"] for s in STATE["servers"] if s["section"] == sec), None)
-            if server_for_section:
-                STATE["server_scores"].setdefault(server_for_section, 0)
-                STATE["server_scores"][server_for_section] += 1
-                STATE["last_sat_server"] = server_for_section
-        elif old == "Taken":
-            tbl["status"] = "Bussing"
-        else:
-            tbl["status"] = "Available"
-            tbl["party"] = None
-            tbl["server"] = None
-        persist_state()
-    return jsonify({"ok": True, "status": tbl["status"]})
-
-@app.route("/api/seat_table", methods=["POST"])
-def api_seat_table():
-    data = request.json or {}
-    tnum = int(data.get("table", -1))
-    wait_idx = data.get("wait_index")  # optional index
-    manual_name = data.get("manual_name")
-    with state_lock:
-        tbl = next((t for t in STATE["tables"] if t["table"] == tnum), None)
-        if not tbl:
-            return jsonify({"ok": False, "error": "Table not found"}), 404
+@app.route("/api/toggle_table", methods=["POST"])
+def api_toggle_table():
+    payload = request.get_json() or {}
+    table_num = int(payload.get("table"))
+    tbl = next((t for t in STATE["tables"] if t["table"] == table_num), None)
+    if not tbl:
+        return jsonify({"error":"table not found"}), 404
+    old = tbl.get("status", "Available")
+    if old == "Available":
+        tbl["status"] = "Taken"
+        # increment server score for that section's server
         sec = tbl.get("section")
-        server_for_section = next((s["name"] for s in STATE["servers"] if s["section"] == sec), None)
-        # increment server score if seating from Available
-        if tbl.get("status", "Available") == "Available" and server_for_section:
-            STATE["server_scores"].setdefault(server_for_section, 0)
-            STATE["server_scores"][server_for_section] += 1
-            STATE["last_sat_server"] = server_for_section
-        if wait_idx is not None:
-            try:
-                wait_idx = int(wait_idx)
-                if 0 <= wait_idx < len(STATE["waitlist"]):
-                    guest = STATE["waitlist"].pop(wait_idx)
-                    tbl["status"] = "Taken"
-                    tbl["party"] = guest["name"]
-                    tbl["server"] = server_for_section
-                    persist_state()
-                    return jsonify({"ok": True, "seated": guest})
-                else:
-                    return jsonify({"ok": False, "error": "Invalid waitlist index"}), 400
-            except Exception:
-                return jsonify({"ok": False, "error": "Invalid wait_index"}), 400
-        elif manual_name:
-            tbl["status"] = "Taken"
-            tbl["party"] = manual_name
-            tbl["server"] = server_for_section
-            persist_state()
-            return jsonify({"ok": True})
-        else:
-            # seat unknown
-            tbl["status"] = "Taken"
-            tbl["party"] = "Unknown Party"
-            tbl["server"] = server_for_section
-            persist_state()
-            return jsonify({"ok": True})
-
-@app.route("/api/clear_table", methods=["POST"])
-def api_clear_table():
-    tnum = int((request.json or {}).get("table", -1))
-    with state_lock:
-        tbl = next((t for t in STATE["tables"] if t["table"] == tnum), None)
-        if not tbl:
-            return jsonify({"ok": False, "error": "Table not found"}), 404
+        serv = server_for_section(sec)
+        if serv:
+            STATE["server_scores"].setdefault(serv, 0)
+            STATE["server_scores"][serv] += 1
+            STATE["last_sat_server"] = serv
+    elif old == "Taken":
+        tbl["status"] = "Bussing"
+    else:
         tbl["status"] = "Available"
         tbl["party"] = None
         tbl["server"] = None
-        persist_state()
-    return jsonify({"ok": True})
+    save_state_to_sheet(STATE)
+    return jsonify({"ok":True,"status":tbl["status"]})
 
-# -------------------
-# Frontend page
-# -------------------
-INDEX_HTML = """
+# Endpoint to set table explicitly (seat a particular waitlist guest)
+@app.route("/api/seat_table", methods=["POST"])
+def api_seat_table():
+    payload = request.get_json() or {}
+    table_num = int(payload.get("table"))
+    wait_idx = payload.get("wait_index")  # optional
+    manual_name = payload.get("manual_name","").strip()
+    server_name = payload.get("server","")
+    tbl = next((t for t in STATE["tables"] if t["table"] == table_num), None)
+    if not tbl:
+        return jsonify({"error":"table not found"}), 404
+    if wait_idx is not None:
+        try:
+            wait_idx = int(wait_idx)
+            guest = STATE["waitlist"].pop(wait_idx)
+            name = guest["name"]
+        except Exception:
+            return jsonify({"error":"invalid waitlist index"}), 400
+    else:
+        name = manual_name or "Unknown Party"
+    tbl["status"] = "Taken"
+    tbl["party"] = name
+    tbl["server"] = server_name or tbl.get("server")
+    # increment server score
+    if tbl.get("server"):
+        STATE["server_scores"].setdefault(tbl["server"],0)
+        STATE["server_scores"][tbl["server"]] += 1
+        STATE["last_sat_server"] = tbl["server"]
+    save_state_to_sheet(STATE)
+    return jsonify({"ok":True})
+
+# ---------- Simple root page rendering ----------
+# This template uses absolute-positioned divs sized responsively.
+TEMPLATE = """
 <!doctype html>
 <html>
 <head>
-  <meta charset="utf-8" />
-  <title>Host Coordinating — Visual</title>
-  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <meta charset="utf-8">
+  <title>Host Coordinating (Flask)</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
   <style>
-    body { font-family: Inter, system-ui, Arial; margin:0; padding:16px; background:#fafafa; color:#111; }
-    .topbar { display:flex; gap:12px; align-items:center; margin-bottom:12px; }
-    .container { display:flex; gap:12px; }
-    .left, .right { width: 360px; max-width: 360px; }
-    .main { flex:1; min-width:300px; }
-    .floor { position:relative; width:100%; height:72vh; background:white; border-radius:8px; border:1px solid rgba(0,0,0,0.06); overflow:hidden; }
-    .table { position:absolute; width:56px; height:56px; border-radius:28px; display:flex; align-items:center; justify-content:center; color:#fff; font-weight:700; cursor:pointer; transform:translate(-50%,-50%); box-shadow:0 2px 8px rgba(0,0,0,0.08); border:2px solid rgba(0,0,0,0.06); text-decoration:none; }
-    .available { background:#2ecc71; }
-    .taken { background:#e74c3c; }
-    .bussing { background:#f1c40f; color:#000; }
-    .section-label { position:absolute; padding:6px 8px; border-radius:6px; font-weight:600; color:#111; box-shadow:0 1px 3px rgba(0,0,0,0.06); transform:translate(-50%,-50%); }
-    .bar-area { position:absolute; border:2px dashed rgba(0,0,0,0.12); border-radius:8px; background:rgba(0,0,0,0.02); }
-    .controls { background:#fff; border-radius:8px; padding:12px; border:1px solid rgba(0,0,0,0.06); }
-    input, select, button { font-size:14px; padding:8px; margin:6px 0; width:100%; box-sizing:border-box; border-radius:6px; border:1px solid rgba(0,0,0,0.08); }
-    button { cursor:pointer; background:#2b8cff; color:white; border:none; }
-    .legend { display:flex; gap:8px; align-items:center; }
-    .legend div { display:flex; gap:6px; align-items:center; }
-    .legend .box { width:16px; height:16px; border-radius:4px; }
-    .small { font-size:13px; color:#555; }
-    .server-list { max-height:220px; overflow:auto; }
+    body { font-family: Arial, Helvetica, sans-serif; margin:0; padding:0; background:#f7f7f7; }
+    header { padding:12px 18px; background:#1f2937; color:white; display:flex; justify-content:space-between; align-items:center; }
+    .wrap { padding: 12px; max-width: 1400px; margin: 0 auto; }
+    .cols { display:flex; gap:12px; align-items:flex-start; }
+    .left { width: 320px; }
+    .center { flex:1; position:relative; min-height:720px; background:white; border:1px solid #ddd; overflow:hidden; }
+    .right { width: 320px; }
+    .panel { background:white; border:1px solid #ddd; padding:10px; margin-bottom:12px; }
+    .table-btn { position:absolute; border-radius:6px; width:56px; height:46px; display:flex; align-items:center; justify-content:center; color:white; font-weight:bold; cursor:pointer; box-shadow:0 2px 6px rgba(0,0,0,0.12); border:2px solid rgba(0,0,0,0.08); text-decoration:none; }
+    .table-available { background:#2ecc71; }
+    .table-taken { background:#e74c3c; }
+    .table-bussing { background:#f1c40f; color:#222; }
+    .section-label { position:absolute; padding:6px 8px; border-radius:6px; color:#111; font-weight:600; }
+    .bar-shape { position:absolute; left:37%; top:35%; width:26%; height:32%; border: 6px solid #222; border-radius:40px 40px 6px 6px; box-sizing:border-box; background:transparent; pointer-events:none; }
+    .circular { border-radius:50%; width:56px; height:56px; display:flex; align-items:center; justify-content:center; color:white; font-weight:bold; box-shadow:0 1px 6px rgba(0,0,0,0.2); }
+    .legend { display:flex; gap:8px; align-items:center; margin-bottom:6px; }
+    .legend span { display:inline-block; width:16px; height:16px; border-radius:4px; margin-right:6px; vertical-align:middle; }
+    .small { font-size:12px; color:#333; }
+    .btn { padding:8px 10px; border-radius:6px; border: none; background:#0ea5a4; color:white; cursor:pointer; }
+    input[type=text], input[type=number] { width:100%; padding:6px; margin-bottom:6px; box-sizing:border-box; }
   </style>
 </head>
 <body>
-  <div class="topbar">
-    <h2 style="margin:0">Host Coordinating — Visual</h2>
-    <div style="flex:1"></div>
-    <div class="legend">
-      <div><div class="box" style="background:#2ecc71"></div> Available</div>
-      <div><div class="box" style="background:#e74c3c"></div> Taken</div>
-      <div><div class="box" style="background:#f1c40f"></div> Bussing</div>
-    </div>
-  </div>
+  <header>
+    <div><strong>Host Coordinating</strong></div>
+    <div class="small">Connected to Sheet: {{ sheet_name }}</div>
+  </header>
 
-  <div class="container">
-    <div class="left controls">
-      <h4>Waitlist</h4>
-      <div id="waitlist_area" class="small"></div>
-      <hr/>
-      <h4>Add to Waitlist</h4>
-      <input id="w_name" placeholder="Name"/>
-      <input id="w_party" placeholder="Party size (2)"/>
-      <input id="w_phone" placeholder="Phone (optional)"/>
-      <input id="w_notes" placeholder="Notes (optional)"/>
-      <button onclick="addWaitlist()">Add</button>
-      <hr/>
-      <h4>Servers</h4>
-      <div class="server-list" id="servers_area"></div>
-      <input id="srv_name" placeholder="Server name"/>
-      <button onclick="addServer()">Add server</button>
-      <hr/>
-      <h4>Present Servers (daily)</h4>
-      <div id="present_area"></div>
-      <button onclick="savePresent()">Save present servers</button>
-    </div>
+  <div class="wrap">
+    <div class="cols">
+      <div class="left">
+        <div class="panel">
+          <h3>Waitlist</h3>
+          <div id="waitlist_area" class="small"></div>
+          <hr/>
+          <input id="wl_name" type="text" placeholder="Guest name"/>
+          <input id="wl_party" type="number" min="1" value="2"/>
+          <input id="wl_notes" type="text" placeholder="Notes (optional)"/>
+          <div style="display:flex; gap:6px;">
+            <button class="btn" onclick="addWaitlist()">Add</button>
+            <button class="btn" style="background:#f97316" onclick="refreshState()">Refresh</button>
+          </div>
+        </div>
 
-    <div class="main">
-      <div id="floor" class="floor"></div>
-      <div style="margin-top:8px">
-        <div id="selected_info" class="small">Click a table to select it.</div>
+        <div class="panel">
+          <h3>Servers & Sections</h3>
+          <div id="servers_area" class="small"></div>
+          <hr/>
+          <input id="sv_name" type="text" placeholder="Server name"/>
+          <button class="btn" onclick="addServer()">Add server</button>
+          <hr/>
+          <div>
+            <strong>Present servers</strong>
+            <div id="present_area" style="margin-top:8px;"></div>
+            <button class="btn" style="margin-top:8px;" onclick="savePresent()">Save present</button>
+          </div>
+        </div>
       </div>
-    </div>
 
-    <div class="right controls">
-      <h4>Quick Actions</h4>
-      <div id="selected_controls">
-        <div class="small" id="sel_details">No table selected</div>
-        <select id="seat_select"></select>
-        <input id="manual_name" placeholder="Manual party name"/>
-        <button onclick="seatSelected()">Seat selected / manual</button>
-        <button onclick="clearSelected()">Clear selected</button>
-        <button onclick="bussSelected()">Mark bussing</button>
+      <div class="center" id="center">
+        <!-- center drawing area; positions are percentages relative to center container -->
+        <div class="bar-shape" title="Bar (non-clickable)"></div>
+        <div id="tables_container"></div>
       </div>
-      <hr/>
-      <h4>Seating Suggestion</h4>
-      <div id="suggestion" class="small"></div>
+
+      <div class="right">
+        <div class="panel">
+          <h3>Rotation & Scores</h3>
+          <div id="rotation_area" class="small"></div>
+          <hr/>
+          <div class="legend small">
+            <span style="background:#2ecc71"></span> Available
+            <span style="background:#e74c3c;margin-left:8px"></span> Taken
+            <span style="background:#f1c40f;margin-left:8px"></span> Bussing
+          </div>
+          <div id="debug_area" class="small"></div>
+        </div>
+      </div>
     </div>
   </div>
 
 <script>
+const TABLE_POSITIONS = {{ table_positions | tojson }};
 let STATE = null;
-let selected_table = null;
+const CENTER = document.getElementById('center');
 
-function fetchState(){
-  fetch('/api/state').then(r=>r.json()).then(s=>{
-    STATE = s;
-    renderWaitlist();
-    renderServers();
-    renderFloor();
-    renderSuggestion();
-  });
+function pxFromPct(pctX, pctY) {
+  // compute pixel position relative to center element dimensions
+  const r = CENTER.getBoundingClientRect();
+  const x = Math.round(pctX * r.width);
+  const y = Math.round(pctY * r.height);
+  return {x,y};
 }
 
-function renderWaitlist(){
-  const el = document.getElementById('waitlist_area');
-  if(!STATE.waitlist || STATE.waitlist.length===0){
-    el.innerHTML = "<div class='small'>Waitlist empty</div>";
-    return;
-  }
-  let html = '<ol>';
-  const now = Date.now()/1000;
-  STATE.waitlist.forEach((g,i)=>{
-    const waitm = Math.floor((now - (g.added_time||now))/60);
-    html += `<li><strong>${g.name}</strong> (p:${g.party_size}) — ${g.phone || 'No phone'} — ${waitm} min</li>`;
-  });
-  html += '</ol>';
-  el.innerHTML = html;
-  // populate seat select
-  const sel = document.getElementById('seat_select');
-  sel.innerHTML = '<option value="">-- none --</option>';
-  STATE.waitlist.forEach((g,i)=>{
-    sel.innerHTML += `<option value="${i}">${i+1}. ${g.name} (p:${g.party_size})</option>`;
-  });
-}
-
-function renderServers(){
-  const el = document.getElementById('servers_area');
-  if(!STATE.servers || STATE.servers.length===0){
-    el.innerHTML = "<div class='small'>No servers</div>";
-  } else {
-    let html = '<ul class="small">';
-    STATE.servers.forEach((s,i)=>{
-      html += `<li>${i+1}. ${s.name} (Section ${s.section})</li>`;
-    });
-    html += '</ul>';
-    el.innerHTML = html;
-  }
-
-  // present servers checkboxes
-  const pres = document.getElementById('present_area');
-  pres.innerHTML = '';
-  STATE.servers.forEach(s=>{
-    const ch = document.createElement('div');
-    ch.innerHTML = `<label><input type="checkbox" value="${s.name}" ${STATE.present_servers && STATE.present_servers.indexOf(s.name)!==-1 ? 'checked':''}/> ${s.name} (sec ${s.section})</label>`;
-    pres.appendChild(ch);
-  });
-}
-
-function savePresent(){
-  const boxes = Array.from(document.querySelectorAll('#present_area input[type=checkbox]'));
-  const vals = boxes.filter(b=>b.checked).map(b=>b.value);
-  fetch('/api/set_present_servers', {
-    method:'POST',
-    headers:{'content-type':'application/json'},
-    body: JSON.stringify({present: vals})
-  }).then(()=>fetchState());
-}
-
-function renderFloor(){
-  const el = document.getElementById('floor');
-  el.innerHTML = '';
-  // draw bar area (non-clickable) - fixed region
-  const bar = document.createElement('div');
-  bar.className = 'bar-area';
-  bar.style.left = '45%'; bar.style.top = '6%';
-  bar.style.width = '40%'; bar.style.height = '18%';
-  bar.style.transform = 'translate(-50%,-50%)';
-  el.appendChild(bar);
-
-  // section labels
-  const plan = (function(){
-    const numS = Math.max(1, Math.min(9, STATE.servers.length || 3));
-    // build plan using server count
-    let plan = null;
-    try {
-      plan = {{plan_map}};
-    } catch(e){
-      plan = null;
+function renderTables() {
+  const container = document.getElementById('tables_container');
+  container.innerHTML = '';
+  for (const t of STATE.tables) {
+    const tnum = t.table;
+    const pos = TABLE_POSITIONS[tnum] || {x:0.5,y:0.5};
+    const coords = pxFromPct(pos.x, pos.y);
+    const el = document.createElement('div');
+    el.className = 'table-btn';
+    el.style.left = coords.x + 'px';
+    el.style.top = coords.y + 'px';
+    el.style.transform = 'translate(-50%,-50%)';
+    // size/shape for circular ones
+    if ([41,42,43].includes(tnum)) {
+      el.style.width = '56px';
+      el.style.height = '56px';
+      el.classList.add('circular');
+    } else {
+      el.style.width = '64px';
+      el.style.height = '44px';
     }
-    return plan;
-  })();
+    // status classes
+    if (t.status === 'Available') el.classList.add('table-available');
+    else if (t.status === 'Taken') el.classList.add('table-taken');
+    else if (t.status === 'Bussing') el.classList.add('table-bussing');
 
-  // draw tables
-  STATE.tables.forEach(tbl=>{
-    const pos = ({{pos_map}})[tbl.table] || {x:0.5,y:0.5};
-    const node = document.createElement('a');
-    node.className = 'table ' + (tbl.status==='Available'?'available':(tbl.status==='Taken'?'taken':'bussing'));
-    node.style.left = (pos.x*100)+'%';
-    node.style.top = (pos.y*100)+'%';
-    node.innerText = tbl.table;
-    node.title = `Table ${tbl.table} | Section ${tbl.section} | Server: ${tbl.server || 'No server'} | Status: ${tbl.status}`;
-    node.onclick = (ev)=>{
+    // show table number and optional small party
+    el.innerHTML = `<div style="text-align:center">${t.table}</div>`;
+    el.title = `Table ${t.table}\\nSection ${t.section}\\nServer: ${t.server || 'None'}\\nStatus: ${t.status}`;
+
+    el.onclick = (ev) => {
       ev.preventDefault();
-      // call API to toggle
-      fetch('/api/click_table', {
-        method:'POST',
-        headers:{'content-type':'application/json'},
-        body: JSON.stringify({table: tbl.table})
-      }).then(r=>r.json()).then(()=>fetchState());
+      toggleTable(t.table);
     };
-    el.appendChild(node);
-  });
+    container.appendChild(el);
+  }
+  renderServerLabels();
+}
 
-  // section labels (center computed via positions)
-  // compute centers here in JS for display of server name
-  const planTables = ({{plan_map}})[Math.max(1, Math.min(9, STATE.servers.length || 3))] || [];
-  // compute centers:
-  const sections = planTables.map((sec, idx)=>{
-    let xs = 0, ys = 0;
-    sec.forEach(t=>{
-      const p = ({{pos_map}})[t] || {x:0.5,y:0.5};
-      xs += p.x; ys += p.y;
-    });
-    const cx = (xs / sec.length) * 100;
-    const cy = (ys / sec.length) * 100 - 8;
-    return {x: cx, y: cy};
-  });
-  sections.forEach((c, idx)=>{
-    const secn = idx+1;
-    const svr = STATE.servers.find(s=>s.section===secn);
+function renderServerLabels() {
+  // remove existing labels
+  const existing = document.querySelectorAll('.section-label');
+  existing.forEach(n => n.remove());
+  // for each section, find a suitable table to anchor a label
+  const sections = {};
+  for (const t of STATE.tables) {
+    const sec = t.section;
+    sections[sec] = sections[sec] || [];
+    sections[sec].push(t.table);
+  }
+  const COLORS = ['#a8d0e6','#f7d794','#f6b93b','#f8a5c2','#c7ecee','#d6a2e8','#b8e994','#f6e58d','#badc58'];
+  for (const secStr in sections) {
+    const sec = parseInt(secStr);
+    const tables = sections[sec];
+    // anchor label to first table in that section
+    const tnum = tables[0];
+    const pos = TABLE_POSITIONS[tnum] || {x:0.5,y:0.5};
+    const coords = pxFromPct(pos.x - 0.08, pos.y - 0.06); // offset left-up
     const label = document.createElement('div');
     label.className = 'section-label';
-    label.style.left = c.x + '%';
-    label.style.top = c.y + '%';
-    label.style.background = ['#a8d0e6','#f7d794','#f6b93b','#f8a5c2','#c7ecee','#d6a2e8','#b8e994','#f6e58d','#badc58'][(idx)%9];
-    label.innerHTML = `Section ${secn}<br/><span style="font-weight:700">${svr ? svr.name : 'No server'}</span>`;
-    document.getElementById('floor').appendChild(label);
+    label.style.left = coords.x + 'px';
+    label.style.top = coords.y + 'px';
+    label.style.background = COLORS[(sec-1) % COLORS.length];
+    const serv = STATE.servers.find(s => s.section === sec);
+    const servname = serv ? serv.name : 'No server';
+    label.innerHTML = `Section ${sec}<br/><small style="font-weight:600">${servname}</small>`;
+    label.style.transform = 'translate(-50%,-50%)';
+    CENTER.appendChild(label);
+  }
+}
+
+async function toggleTable(table) {
+  const resp = await fetch('/api/toggle_table', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({table})
   });
+  if (!resp.ok) {
+    alert('Failed to toggle table');
+    return;
+  }
+  await refreshState();
+}
 
-  // update selected info if selected_table matches
-  if(selected_table){
-    const t = STATE.tables.find(x=>x.table===selected_table);
-    if(t){
-      document.getElementById('sel_details').innerText = `Selected ${selected_table} — Status: ${t.status} — Section: ${t.section} — Server: ${t.server || 'No server'}`;
-    } else {
-      document.getElementById('sel_details').innerText = `Selected ${selected_table}`;
-    }
+async function seatTable(table, wait_index=null, manual_name='', server=null) {
+  const resp = await fetch('/api/seat_table', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({table, wait_index, manual_name, server})
+  });
+  if (!resp.ok) {
+    alert('Failed to seat table');
+  }
+  await refreshState();
+}
+
+async function addWaitlist() {
+  const name = document.getElementById('wl_name').value.trim();
+  const party = parseInt(document.getElementById('wl_party').value) || 2;
+  const notes = document.getElementById('wl_notes').value || '';
+  if (!name) { alert('Name required'); return; }
+  await fetch('/api/add_waitlist', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({name, party_size:party, notes})
+  });
+  document.getElementById('wl_name').value='';
+  document.getElementById('wl_notes').value='';
+  await refreshState();
+}
+
+async function addServer() {
+  const name = document.getElementById('sv_name').value.trim();
+  if (!name) { alert('Server name required'); return; }
+  await fetch('/api/add_server', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({name})
+  });
+  document.getElementById('sv_name').value='';
+  await refreshState();
+}
+
+async function savePresent() {
+  const checks = document.querySelectorAll('.present-check');
+  const present = [];
+  checks.forEach(c => { if (c.checked) present.push(c.value); });
+  await fetch('/api/mark_present', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({present})
+  });
+  await refreshState();
+}
+
+function renderWaitlist() {
+  const area = document.getElementById('waitlist_area');
+  area.innerHTML = '';
+  if (!STATE.waitlist || STATE.waitlist.length===0) {
+    area.innerHTML = '<div class="small">Waitlist empty</div>';
+    return;
+  }
+  const ul = document.createElement('div');
+  STATE.waitlist.forEach((g, i) => {
+    const now = Date.now()/1000;
+    const waitmins = Math.floor((now - (g.added_time || now))/60);
+    const div = document.createElement('div');
+    div.innerHTML = `${i+1}. <strong>${g.name}</strong> (${g.party_size}) - ${g.notes || ''} — ${waitmins} min`;
+    // remove button
+    const rem = document.createElement('button');
+    rem.style.marginLeft = '8px';
+    rem.className = 'btn';
+    rem.style.background='#ef4444';
+    rem.textContent = 'Remove';
+    rem.onclick = async () => {
+      await fetch('/api/remove_waitlist', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({index: i})
+      });
+      await refreshState();
+    };
+    div.appendChild(rem);
+    ul.appendChild(div);
+  });
+  area.appendChild(ul);
+}
+
+function renderServers() {
+  const area = document.getElementById('servers_area');
+  area.innerHTML = '';
+  if (!STATE.servers || STATE.servers.length===0) {
+    area.innerHTML = '<div class="small">No servers</div>';
+    return;
+  }
+  STATE.servers.forEach((s,i) => {
+    const div = document.createElement('div');
+    div.innerHTML = `${i+1}. <strong>${s.name}</strong> (Section ${s.section}) `;
+    const rem = document.createElement('button');
+    rem.className='btn';
+    rem.style.background='#ef4444';
+    rem.style.marginLeft='6px';
+    rem.textContent = 'Remove';
+    rem.onclick = async () => {
+      await fetch('/api/remove_server', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body: JSON.stringify({index:i})
+      });
+      await refreshState();
+    };
+    div.appendChild(rem);
+    area.appendChild(div);
+  });
+  // present checkboxes
+  const presentArea = document.getElementById('present_area');
+  presentArea.innerHTML = '';
+  STATE.servers.forEach(s => {
+    const cb = document.createElement('input');
+    cb.type = 'checkbox';
+    cb.value = s.name;
+    cb.className = 'present-check';
+    cb.checked = STATE.present_servers.includes(s.name);
+    const lbl = document.createElement('label');
+    lbl.appendChild(cb);
+    lbl.appendChild(document.createTextNode(' ' + s.name));
+    presentArea.appendChild(lbl);
+    presentArea.appendChild(document.createElement('br'));
+  });
+}
+
+function renderRotation() {
+  const rot = document.getElementById('rotation_area');
+  rot.innerHTML = '';
+  if (!STATE.seating_rotation || STATE.seating_rotation.length===0) {
+    rot.innerHTML = '<div class="small">No rotation</div>';
+    return;
+  }
+  let inner = '<div class="small">';
+  STATE.seating_rotation.forEach(s => {
+    const score = STATE.server_scores[s] || 0;
+    inner += `<div>${s} — ${score}</div>`;
+  });
+  inner += '</div>';
+  rot.innerHTML = inner;
+}
+
+function renderDebug() {
+  const dbg = document.getElementById('debug_area');
+  dbg.innerHTML = '<pre class="small">' + JSON.stringify(STATE.server_scores, null, 2) + '</pre>';
+}
+
+async function refreshState() {
+  try {
+    const resp = await fetch('/api/state');
+    STATE = await resp.json();
+    // ensure present_servers array present
+    STATE.present_servers = STATE.present_servers || [];
+    renderWaitlist();
+    renderServers();
+    renderTables();
+    renderRotation();
+    renderDebug();
+  } catch (e) {
+    console.error('Failed to refresh state', e);
   }
 }
 
-function renderSuggestion(){
-  let suggestionText = 'No suggestion available.';
-  const present = STATE.present_servers || [];
-  const rotation = STATE.seating_rotation ? STATE.seating_rotation.filter(r=>present.indexOf(r)!==-1) : [];
-  if(rotation.length){
-    let minScore = Infinity;
-    rotation.forEach(s=>{
-      const sc = STATE.server_scores && STATE.server_scores[s] ? STATE.server_scores[s] : 0;
-      if(sc < minScore) minScore = sc;
-    });
-    const candidates = rotation.filter(s => (STATE.server_scores && STATE.server_scores[s] ? STATE.server_scores[s] : 0) === minScore);
-    if(candidates.length){
-      suggestionText = `Suggested server: ${candidates[0]}.`;
-      if(STATE.waitlist && STATE.waitlist.length){
-        suggestionText = `Seat next party (${STATE.waitlist[0].name}) with server: ${candidates[0]}`;
-      }
-    }
-  }
-  document.getElementById('suggestion').innerText = suggestionText;
-}
-
-function addWaitlist(){
-  const name = document.getElementById('w_name').value.trim();
-  const party = parseInt(document.getElementById('w_party').value || 2);
-  const phone = document.getElementById('w_phone').value.trim();
-  const notes = document.getElementById('w_notes').value.trim();
-  if(!name) return alert('Name required');
-  fetch('/api/add_waitlist', {
-    method:'POST', headers:{'content-type':'application/json'},
-    body: JSON.stringify({name, party_size: party, phone, notes})
-  }).then(()=>fetchState());
-}
-
-function addServer(){
-  const name = document.getElementById('srv_name').value.trim();
-  if(!name) return alert('Server name required');
-  fetch('/api/add_server', {method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({name})})
-    .then(()=>fetchState());
-}
-
-function seatSelected(){
-  if(!selected_table) return alert('Select a table from the floor first');
-  const sel = document.getElementById('seat_select').value;
-  const manual = document.getElementById('manual_name').value.trim();
-  let payload = {table: selected_table};
-  if(sel) payload.wait_index = parseInt(sel);
-  if(manual) payload.manual_name = manual;
-  fetch('/api/seat_table', {method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify(payload)})
-    .then(()=>{ fetchState(); });
-}
-
-function clearSelected(){
-  if(!selected_table) return alert('Select a table');
-  fetch('/api/clear_table', {method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({table:selected_table})})
-    .then(()=>{ selected_table = null; fetchState(); });
-}
-
-function bussSelected(){ 
-  if(!selected_table) return alert('Select a table');
-  fetch('/api/click_table', {method:'POST', headers:{'content-type':'application/json'}, body: JSON.stringify({table:selected_table})})
-    .then(()=>fetchState());
-}
-
-document.addEventListener('click', function(e){
-  // if clicked a table element, set selected_table
-  const el = e.target;
-  if(el.classList && el.classList.contains('table')){
-    selected_table = parseInt(el.innerText);
-    // show selected area details
-    const t = STATE.tables.find(x=>x.table===selected_table);
-    document.getElementById('sel_details').innerText = `Selected ${selected_table} — Status: ${t.status} — Section: ${t.section} — Server: ${t.server || 'No server'}`;
-    // set the seat_select dropdown to none to avoid mismatch
-    document.getElementById('seat_select').value = '';
-  }
+// initial load + responsive redraw
+window.addEventListener('load', async () => {
+  await refreshState();
+  window.addEventListener('resize', () => {
+    // redraw positions
+    renderTables();
+  });
 });
-
-fetchState();
-setInterval(fetchState, 5000); // poll every 5s
 </script>
-
 </body>
 </html>
 """
 
-# -------------------
-# Template injection helpers
-# -------------------
-# We inject the TABLE_POSITIONS and TABLE_PLANS as JSON strings into the HTML template
 @app.route("/")
 def index():
-    template = INDEX_HTML
-    # basic injection: plan_map and pos_map placeholders replaced by JSON literals
-    plan_map_json = json.dumps({k: v for k, v in TABLE_PLANS.items()})
-    pos_map_json = json.dumps(TABLE_POSITIONS)
-    # replace the placeholders ({{plan_map}} and {{pos_map}}) safely
-    template = template.replace("{{plan_map}}", plan_map_json)
-    template = template.replace("{{pos_map}}", pos_map_json)
-    return render_template_string(template)
+    # render template with positions and sheet name
+    # convert present_servers to list for template use
+    try:
+        return render_template_string(
+            TEMPLATE,
+            table_positions = TABLE_POSITIONS,
+            sheet_name = SHEET_NAME
+        )
+    except Exception as e:
+        return f"Template rendering error: {e}", 500
 
-# -------------------
-# Run
-# -------------------
+# ---------- Run (for debug only) ----------
 if __name__ == "__main__":
-    # ensure STATE consistency on startup
-    with state_lock:
-        # if sheet was empty/contains {}, initialize default
-        if not STATE or (isinstance(STATE, dict) and len(STATE)==0):
-            STATE = default_state()
-            write_state_to_sheet(STATE)
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 8501)), debug=False)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)), debug=True)
