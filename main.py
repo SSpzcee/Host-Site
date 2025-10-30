@@ -23,26 +23,14 @@ from flask import Flask, render_template_string, request, jsonify, send_from_dir
 import gspread
 from google.oauth2 import service_account
 
-# -------------------
-# Configuration
-# -------------------
-# Required environment variables:
-# - GCP_SERVICE_ACCOUNT_JSON: the entire service account JSON as a string (or path to file)
-# - SHEET_NAME: the Google Spreadsheet name to use (sheet must be accessible by the service account)
-#
-# Example (Linux):
-# export GCP_SERVICE_ACCOUNT_JSON='{"type": "...", ... }'
-# export SHEET_NAME='MyCoordinatingSheet'
-#
-# Alternative: set GCP_SERVICE_ACCOUNT_JSON_PATH to a path containing the JSON.
-GCP_SERVICE_ACCOUNT_JSON = os.environ.get("GCP_SERVICE_ACCOUNT_JSON")
-GCP_SERVICE_ACCOUNT_JSON_PATH = os.environ.get("GCP_SERVICE_ACCOUNT_JSON_PATH")
-SHEET_NAME = os.environ.get("SHEET_NAME") or os.environ.get("GCP_SHEET_NAME") or "HostCoordinating"
+scope = ["https://www.googleapis.com/auth/spreadsheets"]
 
-if not (GCP_SERVICE_ACCOUNT_JSON or GCP_SERVICE_ACCOUNT_JSON_PATH):
-    raise RuntimeError(
-        "Missing credentials: set GCP_SERVICE_ACCOUNT_JSON (JSON string) or GCP_SERVICE_ACCOUNT_JSON_PATH (path)"
-    )
+# Load credentials from environment variable
+creds_dict = json.loads(os.environ["GOOGLE_CREDS"])
+creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
+client = gspread.authorize(creds)
+
+sheet = client.open("YOUR_SHEET_NAME").sheet1
 
 # -------------------
 # Google Sheets init
