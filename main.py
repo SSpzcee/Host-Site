@@ -25,22 +25,31 @@ from google.oauth2.service_account import Credentials
 
 app = Flask(__name__)
 
+@app.route("/")
+def index():
+    return "Google Sheets + Flask running!"
+
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=8080)
+
 # -------------------------
 # GOOGLE SHEETS SETUP
 # -------------------------
 # Load the credentials from the environment variable (Render dashboard)
+GCP_SERVICE_ACCOUNT_JSON = os.getenv("GCP_SERVICE_ACCOUNT_JSON")
+
 def get_gspread_client():
-    gcp_json = os.environ.get("GCP_SERVICE_ACCOUNT_JSON")
-    if not gcp_json:
-        raise Exception("Missing GCP_SERVICE_ACCOUNT_JSON environment variable.")
+    if not GCP_SERVICE_ACCOUNT_JSON:
+        raise ValueError("Missing GCP_SERVICE_ACCOUNT_JSON environment variable")
 
-    creds_dict = json.loads(gcp_json)
-    scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-    creds = Credentials.from_service_account_info(creds_dict, scopes=scope)
-    return gspread.authorize(creds)
-
-gc = get_gspread_client()
-sheet = gc.open("Hosting Sheet").sheet1
+    try:
+        service_account_info = json.loads(GCP_SERVICE_ACCOUNT_JSON)
+        gc = gspread.service_account_from_dict(service_account_info)
+        print("✅ Connected to Google Sheets successfully!")
+        return gc
+    except Exception as e:
+        print("❌ Error initializing Google Sheets client:", e)
+        raise
 
 # -------------------
 # Google Sheets init
