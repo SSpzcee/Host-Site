@@ -17,6 +17,52 @@ async function fetchState(){
   state = r.data;
   renderWaitlist();
   renderServers();
+  // ----- SERVER MANAGEMENT -----
+const addServerForm = document.getElementById("addServerForm");
+
+if(addServerForm){
+  addServerForm.addEventListener("submit", async (e)=>{
+    e.preventDefault();
+    const fd = new FormData(addServerForm);
+    await axios.post("/api/add_server", {
+      name: fd.get("name"),
+      section: fd.get("section")
+    });
+    addServerForm.reset();
+    fetchState();
+  });
+}
+
+function renderServers(){
+  serverLoadsEl.innerHTML = "";
+  for(const [name, data] of Object.entries(state.servers)){
+    const li = document.createElement("li");
+    li.className = "list-group-item d-flex flex-column";
+    const load = state.server_loads[name] || 0;
+    const secOpts = [1,2,3].map(s=>`<option value="${s}" ${data.section==s?"selected":""}>Sec ${s}</option>`).join("");
+    li.innerHTML = `
+      <div class="d-flex justify-content-between align-items-center mb-1">
+        <strong>${name}</strong> <span class="badge">${load}</span>
+      </div>
+      <div class="d-flex gap-2 align-items-center">
+        <label class="form-check-label small">Present</label>
+        <input type="checkbox" ${data.present?"checked":""} onchange="togglePresent('${name}', this.checked)">
+        <select class="form-select form-select-sm" onchange="setSection('${name}', this.value)">${secOpts}</select>
+      </div>`;
+    serverLoadsEl.appendChild(li);
+  }
+}
+
+async function togglePresent(name, present){
+  await axios.post("/api/update_server",{name, present});
+  fetchState();
+}
+
+async function setSection(name, section){
+  await axios.post("/api/update_server",{name, section});
+  fetchState();
+}
+
   renderTables();
   updateServerSuggestion();
 }
