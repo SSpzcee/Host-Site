@@ -60,8 +60,20 @@
       </div>
       <hr>
       <h6>Servers & Loads</h6>
-      <ul id="serverLoads" class="list-group mb-2"></ul>
-      <button id="suggestBtn" class="btn btn-sm btn-outline-primary">Get Suggestion</button>
+<div id="serverManager" class="mb-3">
+  <form id="addServerForm" class="d-flex gap-1 mb-2">
+    <input class="form-control" name="name" placeholder="Server name" required>
+    <select class="form-select" name="section">
+      <option value="1">Sec 1</option>
+      <option value="2">Sec 2</option>
+      <option value="3">Sec 3</option>
+    </select>
+    <button class="btn btn-success">+</button>
+  </form>
+  <ul id="serverLoads" class="list-group mb-2"></ul>
+</div>
+<button id="suggestBtn" class="btn btn-sm btn-outline-primary">Get Suggestion</button>
+
     </div>
   </div>
 </div>
